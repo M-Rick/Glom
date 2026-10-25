@@ -1,0 +1,25 @@
+diff --git libgda/gda-data-model.c libgda/gda-data-model.c
+index ba56d6701..5bcc3f0f4 100644
+--- libgda/gda-data-model.c
++++ libgda/gda-data-model.c
+@@ -1974,7 +1974,19 @@ add_xml_row (GdaDataModel *model, xmlNodePtr xml_row, GError **error)
+ 				gda_value_set_null (value);
+ 		}
+ 
+-		g_ptr_array_index (values, pos) = value;
++		/* The column for a localized value (this_lang set) is the previous one
++		 * (pos - 1): it replaces the default value stored there. Writing at pos
++		 * instead overflowed the fixed-size values array by one slot when a
++		 * translated entry matched the current locale (e.g. the charset list
++		 * parsed when creating a database), corrupting the heap. Write at the
++		 * right column, and never past the array bounds. */
++		{
++			gint col_index = this_lang ? (pos - 1) : pos;
++			if ((col_index >= 0) && ((gsize) col_index < values->len))
++				g_ptr_array_index (values, col_index) = value;
++			else if (value)
++				gda_value_free (value);
++		}
+ 		if (this_lang)
+ 			xmlFree (this_lang);
+ 		else

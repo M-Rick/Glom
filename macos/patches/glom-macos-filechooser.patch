@@ -1,0 +1,10 @@
+--- glom/dialog_existing_or_new.cc
++++ glom/dialog_existing_or_new.cc
+@@ -789,6 +789,7 @@
+ 
+     auto filter = Gtk::FileFilter::create();
+     filter->add_mime_type("application/x-glom");
++    filter->add_pattern("*.glom"); // macOS : g_content_type renvoie un UTI, pas le mime freedesktop
+     filter->set_name("Glom files");
+     dialog.add_filter(filter);
+ 

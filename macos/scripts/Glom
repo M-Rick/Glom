@@ -1,0 +1,171 @@
+#!/bin/sh
+#
+# Glom - lanceur du bundle macOS (Glom 1.32.0, MacPorts, Apple Silicon).
+#
+# Installe en Contents/MacOS/Glom (= CFBundleExecutable). Transpose du lanceur
+# Gnumeric d'A. Gillaizeau (lignee S. K. Lehmann, GPL v2+) : memes principes,
+# meme gestion clair/sombre par GTK_THEME, adaptes a Glom.
+#
+# Chemins relatifs a ce script, donc l'environnement suit l'app. Le backend
+# quartz de GTK 3.24 ignore l'apparence macOS : on lit l'accent et le mode puis
+# on pose un GTK_THEME parmi les themes de share/themes, plus le theme d'icones.
+#
+# Echappements :
+#   GLOM_NO_MACOS_THEME=1  ne pas imposer de theme (laisse Adwaita)
+#   GLOM_NO_FORCE_LANG=1   ne pas forcer la locale macOS
+#   GTK_THEME=...          un theme explicite l'emporte toujours
+#
+# Specifique Glom vs Gnumeric : PostgreSQL 16 dans le PATH (serveur embarque),
+# GI_TYPELIB_PATH (Glom charge gi.repository.Gda pour les champs Python), et
+# ouverture des paquets .glomlibrary.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUNDLE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+RESOURCES_DIR="$BUNDLE_DIR/Resources"
+
+# Argument -psn_* ajoute par Launch Services au double-clic
+if [ "${1#-psn_}" != "$1" ]; then
+    shift 1
+fi
+
+# -----------------------------------------------------------------------------
+# PATH : outils du bundle + serveur PostgreSQL 16 embarque
+# -----------------------------------------------------------------------------
+export PATH="$RESOURCES_DIR/bin:$RESOURCES_DIR/lib/postgresql18/bin:$PATH"
+
+# -----------------------------------------------------------------------------
+# Application Support et Caches (conventions macOS via XDG)
+# -----------------------------------------------------------------------------
+glom_dir="$HOME/Library/Application Support/Glom"
+glom_cache="$HOME/Library/Caches/org.gnome.glom"
+mkdir -p "$glom_dir" "$glom_cache"
+
+# -----------------------------------------------------------------------------
+# Bibliotheques
+# -----------------------------------------------------------------------------
+export DYLD_FALLBACK_LIBRARY_PATH="$RESOURCES_DIR/lib:$DYLD_FALLBACK_LIBRARY_PATH"
+if [ -f "$RESOURCES_DIR/lib/charset.alias" ]; then
+    export CHARSETALIASDIR="$RESOURCES_DIR/lib"
+fi
+
+# -----------------------------------------------------------------------------
+# GTK+3, GDK, XDG, GIO, fontconfig, GSettings, introspection
+# -----------------------------------------------------------------------------
+export GTK_DATA_PREFIX="$RESOURCES_DIR"
+export GTK_EXE_PREFIX="$RESOURCES_DIR"
+export GTK_PATH="$RESOURCES_DIR"
+
+export GDK_PIXBUF_MODULEDIR="$RESOURCES_DIR/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+export GDK_PIXBUF_MODULE_FILE="$RESOURCES_DIR/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+
+export XDG_CONFIG_DIRS="$RESOURCES_DIR/etc/xdg"
+export XDG_CONFIG_HOME="$glom_dir"
+export XDG_DATA_DIRS="$RESOURCES_DIR/share"      # reconnaissance des .glom
+export XDG_CACHE_HOME="$glom_cache"
+
+export GIO_MODULE_DIR="$RESOURCES_DIR/lib/gio/modules"
+export FONTCONFIG_PATH="$RESOURCES_DIR/etc/fonts"
+export GSETTINGS_SCHEMA_DIR="$RESOURCES_DIR/share/glib-2.0/schemas"
+export GI_TYPELIB_PATH="$RESOURCES_DIR/lib/girepository-1.0"
+
+# -----------------------------------------------------------------------------
+# Python embarque (champs calcules), seulement s'il est present
+# -----------------------------------------------------------------------------
+for _pyver in 3.14 3.13 3.12; do
+    _pyhome="$RESOURCES_DIR/Library/Frameworks/Python.framework/Versions/$_pyver"
+    if [ -d "$_pyhome" ]; then
+        export PYTHONHOME="$_pyhome"
+        export PYTHONPATH="$RESOURCES_DIR/lib/python$_pyver/site-packages:$_pyhome/lib/python$_pyver/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+        break
+    fi
+done
+
+# -----------------------------------------------------------------------------
+# Locale macOS forcee (formats de dates et de nombres des bases)
+# -----------------------------------------------------------------------------
+if [ -z "${GLOM_NO_FORCE_LANG:-}" ]; then
+    macos_locale=$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//')
+    if [ -n "$macos_locale" ]; then
+        export LANG="${macos_locale}.UTF-8"
+    else
+        export LANG="en_US.UTF-8"
+    fi
+fi
+export I18NPATH="/usr/share/locale:${I18NPATH:-}"
+
+# -----------------------------------------------------------------------------
+# Apparence macOS : mode clair/sombre et accent, en un seul GTK_THEME.
+# Themes dans share/themes, un par accent plus "default" (multicolore/absent).
+# Chaque theme porte les deux modes : GTK charge gtk.css en clair, gtk-dark.css
+# quand le nom finit par ":dark".
+# -----------------------------------------------------------------------------
+if [ -z "${GLOM_NO_MACOS_THEME:-}" ] && [ -z "${GTK_THEME:-}" ]; then
+
+    case "$(defaults read -g AppleAccentColor 2>/dev/null)" in
+        -1) base="graphite" ;;   # graphite (thème Glom nomme graphite, cf. Gnumeric "grey")
+         0) base="red"      ;;
+         1) base="orange"   ;;
+         2) base="yellow"   ;;
+         3) base="green"    ;;
+         4) base="blue"     ;;
+         5) base="purple"   ;;
+         6) base="pink"     ;;
+         *) base="default"  ;;   # multicolore / cle absente
+    esac
+
+    if defaults read -g AppleInterfaceStyle 2>/dev/null | grep -qi dark; then
+        export GTK_THEME="${base}:dark"
+        icon_theme="Icons-dark"
+    else
+        export GTK_THEME="$base"
+        icon_theme="Icons"
+    fi
+
+fi
+
+# settings.ini : reglages GtkSettings sans equivalent en variable, regeneres a
+# chaque lancement. Hors du bloc theme pour s'appliquer meme si GTK_THEME force.
+ini_dir="$glom_dir/gtk-3.0"
+mkdir -p "$ini_dir"
+{
+    printf '[Settings]\n'
+    printf 'gtk-enable-mnemonics=0\n'
+    if [ -n "${icon_theme:-}" ]; then
+        printf 'gtk-icon-theme-name=%s\n' "$icon_theme"
+    fi
+} > "$ini_dir/settings.ini"
+
+# -----------------------------------------------------------------------------
+# Hook environment.sh : surcharges utilisateur sans editer ce fichier
+# -----------------------------------------------------------------------------
+if [ -f "$RESOURCES_DIR/environment.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$RESOURCES_DIR/environment.sh"
+fi
+
+# -----------------------------------------------------------------------------
+# Paquet .glomlibrary : ouvrir le .glom a l'interieur (macOS passe le paquet)
+# Reconstruction des arguments en sh (pas de tableau).
+# -----------------------------------------------------------------------------
+_first=1
+for a in "$@"; do
+    case "$a" in
+        *.glomlibrary)
+            if [ -d "$a" ]; then
+                _inner=$(ls "$a"/*.glom 2>/dev/null | head -1)
+                [ -n "$_inner" ] && a="$_inner"
+            fi ;;
+    esac
+    if [ "$_first" = 1 ]; then set -- "$a"; _first=0; else set -- "$@" "$a"; fi
+done
+
+# -----------------------------------------------------------------------------
+# Lancement via glom-bin (lien) pour rattacher le processus au bundle
+# -----------------------------------------------------------------------------
+if [ -e "$SCRIPT_DIR/glom-bin" ]; then
+    exec "$SCRIPT_DIR/glom-bin" "$@"
+else
+    echo "Avertissement : $SCRIPT_DIR/glom-bin manquant ; le menu affichera 'glom'."
+    echo "               Le recreer : ln -s ../Resources/bin/glom \"$SCRIPT_DIR/glom-bin\""
+    exec "$RESOURCES_DIR/bin/glom" "$@"
+fi

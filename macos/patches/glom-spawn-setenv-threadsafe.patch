@@ -1,0 +1,164 @@
+diff --git glom/libglom/spawn_with_feedback.cc glom/libglom/spawn_with_feedback.cc
+index f1b7c07a..7a06c76f 100644
+--- glom/libglom/spawn_with_feedback.cc
++++ glom/libglom/spawn_with_feedback.cc
+@@ -150,7 +150,7 @@ public:
+ 
+   /** TODO: Document the redirect parameter.
+    */
+-  SpawnInfo(const Glib::ustring& command_line, int redirect):
++  SpawnInfo(const Glib::ustring& command_line, int redirect, const std::vector<std::string>& envp = std::vector<std::string>()):
+     running(false), return_status(0)
+   {
+ #ifdef G_OS_WIN32
+@@ -188,7 +188,44 @@ public:
+       std::vector<std::string> arguments = Glib::shell_parse_argv(command_line);
+       int child_stdout = 0;
+       int child_stderr = 0;
+-      Glib::spawn_async_with_pipes(Glib::get_current_dir(), arguments, Glib::SPAWN_DO_NOT_REAP_CHILD, sigc::slot<void()>(), &pid, nullptr, (redirect & REDIRECT_STDOUT) ? &child_stdout : nullptr, (redirect & REDIRECT_STDERR) ? &child_stderr : nullptr);
++      if(envp.empty())
++      {
++        Glib::spawn_async_with_pipes(Glib::get_current_dir(), arguments, Glib::SPAWN_DO_NOT_REAP_CHILD, sigc::slot<void()>(), &pid, nullptr, (redirect & REDIRECT_STDOUT) ? &child_stdout : nullptr, (redirect & REDIRECT_STDERR) ? &child_stderr : nullptr);
++      }
++      else
++      {
++        // Give the child process its own environment instead of mutating the
++        // parent's with setenv(): this code can run after GLib has created
++        // worker threads, and setenv()/putenv() are not thread-safe (they
++        // mutate environ), which corrupts the heap. g_spawn_async_with_pipes()
++        // accepts an explicit child environment, so the parent is left alone.
++        std::vector<char*> argv_c;
++        argv_c.reserve(arguments.size() + 1);
++        for(const auto& arg : arguments)
++          argv_c.push_back(const_cast<char*>(arg.c_str()));
++        argv_c.push_back(nullptr);
++
++        std::vector<char*> envp_c;
++        envp_c.reserve(envp.size() + 1);
++        for(const auto& var : envp)
++          envp_c.push_back(const_cast<char*>(var.c_str()));
++        envp_c.push_back(nullptr);
++
++        const std::string workdir = Glib::get_current_dir();
++        GError* gerror = nullptr;
++        g_spawn_async_with_pipes(workdir.c_str(), argv_c.data(), envp_c.data(),
++                                 G_SPAWN_DO_NOT_REAP_CHILD, nullptr, nullptr, &pid,
++                                 nullptr,
++                                 (redirect & REDIRECT_STDOUT) ? &child_stdout : nullptr,
++                                 (redirect & REDIRECT_STDERR) ? &child_stderr : nullptr,
++                                 &gerror);
++        if(gerror)
++        {
++          const std::string message = gerror->message ? gerror->message : "g_spawn_async_with_pipes() failed";
++          g_error_free(gerror);
++          throw SpawnError(message);
++        }
++      }
+       if(redirect & REDIRECT_STDOUT)
+         redirect_to_string(child_stdout, stdout_text);
+       if(redirect & REDIRECT_STDERR)
+@@ -288,9 +325,9 @@ private:
+ #endif
+ };
+ 
+-static std::shared_ptr<const SpawnInfo> spawn_async(const Glib::ustring& command_line, int redirect)
++static std::shared_ptr<const SpawnInfo> spawn_async(const Glib::ustring& command_line, int redirect, const std::vector<std::string>& envp = std::vector<std::string>())
+ {
+-  return std::shared_ptr<const SpawnInfo>(new SpawnInfo(command_line, redirect));
++  return std::shared_ptr<const SpawnInfo>(new SpawnInfo(command_line, redirect, envp));
+ }
+ 
+ /**
+@@ -311,7 +348,7 @@ static bool spawn_async_end(std::shared_ptr<const SpawnInfo> info, std::string*
+   return !info->is_running();
+ }
+ 
+-static int spawn_sync(const Glib::ustring& command_line, std::string* stdout_text, std::string* stderr_text)
++static int spawn_sync(const Glib::ustring& command_line, std::string* stdout_text, std::string* stderr_text, const std::vector<std::string>& envp = std::vector<std::string>())
+ {
+   int redirect_flags = 0;
+   if(stdout_text)
+@@ -322,7 +359,7 @@ static int spawn_sync(const Glib::ustring& command_line, std::string* stdout_tex
+ 
+   auto mainloop = Glib::MainLoop::create(false);
+ 
+-  auto info = spawn_async(command_line, redirect_flags); //This could throw
++  auto info = spawn_async(command_line, redirect_flags, envp); //This could throw
+   info->signal_finished().connect(
+     sigc::bind(sigc::ptr_fun(&on_spawn_info_finished), std::ref(mainloop) ) );
+ 
+@@ -443,25 +480,33 @@ namespace
+ 
+   bool second_command_on_timeout(const std::string& second_command, const std::string& success_text, const SlotProgress& slot_progress, const Glib::RefPtr<Glib::MainLoop>& mainloop)
+   {
++    std::vector<std::string> child_envp;
++#ifdef G_OS_WIN32
+     Glib::ustring stored_env_lang;
+     Glib::ustring stored_env_language;
++#endif // G_OS_WIN32
+     if(!success_text.empty())
+     {
+-      // If we are going to check the text output of the second command,
+-      // then we should make sure that we get a fairly canonical version of that text,
+-      // so we set the LANG for this command.
+-      // We have to set LANGUAGE (a GNU extension) as well as LANG, because it
+-      // is probably defined on the system already and that definition would override our LANG:
+-      // (Note that we can not just do "LANG=C;the_command", as on the command line, because g_spawn() does not support that.)
+-
+-      #ifdef GLOM_SPAWN_DEBUG
+-      std::cout << std::endl << "debug: temporarily setting LANG and LANGUAGE environment variables to \"C\"\n";
+-      #endif //GLOM_SPAWN_DEBUG
+-
++      // We want a canonical (C locale) version of the command's output so we
++      // can parse it. We must NOT force that with setenv()/putenv() on the
++      // parent process here: this code can run after GLib has created worker
++      // threads, and those functions are not thread-safe, so mutating environ
++      // corrupts the heap. Instead we build a child environment with LANG and
++      // LANGUAGE forced to "C" and hand it to the child process only.
++#ifdef G_OS_WIN32
++      // Windows is not affected by the setenv()/fork() thread-safety issue.
+       stored_env_lang = Glib::getenv("LANG");
+       stored_env_language = Glib::getenv("LANGUAGE");
+       Glib::setenv("LANG", "C", true /* overwrite */);
+       Glib::setenv("LANGUAGE", "C", true /* overwrite */);
++#else
++      char** env = g_get_environ();
++      env = g_environ_setenv(env, "LANG", "C", TRUE);
++      env = g_environ_setenv(env, "LANGUAGE", "C", TRUE);
++      for(char** e = env; e && *e; ++e)
++        child_envp.push_back(*e);
++      g_strfreev(env);
++#endif // G_OS_WIN32
+     }
+ 
+     #ifdef GLOM_SPAWN_DEBUG
+@@ -472,7 +517,7 @@ namespace
+     std::string stdout_output;
+     try
+     {
+-      return_status = Impl::spawn_sync(second_command, &stdout_output, nullptr);
++      return_status = Impl::spawn_sync(second_command, &stdout_output, nullptr, child_envp);
+     }
+     catch(const Impl::SpawnError& ex)
+     {
+@@ -481,16 +526,15 @@ namespace
+       // a row or so.
+     }
+ 
++#ifdef G_OS_WIN32
+     if(!success_text.empty())
+     {
+-      // Restore the previous environment variable values:
+-      #ifdef GLOM_SPAWN_DEBUG
+-      std::cout << std::endl << "debug: restoring the LANG and LANGUAGE environment variables.\n";
+-      #endif //GLOM_SPAWN_DEBUG
+-
++      // Restore the previous environment variable values (Windows only; the
++      // other platforms never touched the parent environment).
+       Glib::setenv("LANG", stored_env_lang, true /* overwrite */);
+       Glib::setenv("LANGUAGE", stored_env_language, true /* overwrite */);
+     }
++#endif // G_OS_WIN32
+ 
+     if(return_status == EXIT_SUCCESS)
+     {

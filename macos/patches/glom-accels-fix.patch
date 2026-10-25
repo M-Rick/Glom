@@ -1,0 +1,14 @@
+--- glom/application.cc
++++ glom/application.cc
+@@ -104,8 +104,9 @@
+   set_accel_for_action("win.close", "<Primary>w");
+   set_accel_for_action("win.print", "<Primary>p"); //Not in the main window, but in the Relationships Overview window, and maybe others.
+   set_accel_for_action("win.print-preview", "<Shift><Primary>p"); //Not in the main window, but in the Print Layout window, and maybe others.
+-  set_accel_for_action("edit.copy", "<Primary>c");
+-  set_accel_for_action("edit.paste", "<Primary>v");
++  set_accel_for_action("win.copy", "<Primary>c");   // le menu utilise win.copy, pas edit.copy
++  set_accel_for_action("win.paste", "<Primary>v");  // idem
++  set_accel_for_action("win.cut", "<Primary>x");    // n'avait aucun raccourci
+   set_accel_for_action("edit.find", "<Primary>f");
+ }
+ 

@@ -1,0 +1,1671 @@
+--- glom/appwindow.h	2026-10-24 17:34:24.518011646 +0000
++++ glom/appwindow.h	2026-10-24 17:34:24.583011646 +0000
+@@ -239,6 +239,12 @@
+    */
+   bool check_document_hosting_mode_is_supported(const std::shared_ptr<Document>& document);
+ 
++  /** Migrate an old self-hosted PostgreSQL database (chosen by the user) to the
++   * bundled PostgreSQL 18, using the bundled glom-pg-migrate.sh tool.
++   * Available in all builds.
++   */
++  void on_menu_file_migrate();
++
+ #ifndef GLOM_ENABLE_CLIENT_ONLY
+   void existing_or_new_new();
+ 
+--- glom/appwindow.cc	2026-10-24 17:34:24.520011646 +0000
++++ glom/appwindow.cc	2026-10-24 17:34:24.584011646 +0000
+@@ -34,6 +34,10 @@
+ #endif // !GLOM_ENABLE_CLIENT_ONLY
+ 
+ #include <glom/utils_ui.h>
++#include <gtkmm/filechooserdialog.h>
++#include <gtkmm/messagedialog.h>
++#include <gtkmm/filefilter.h>
++#include <glibmm/main.h>
+ #include <glom/glade_utils.h>
+ #include <libglom/algorithms_utils.h>
+ #include <libglom/db_utils.h>
+@@ -268,6 +272,11 @@
+   m_action_group_file->add_action("open",
+     sigc::mem_fun((GlomBakery::AppWindow_WithDoc&)*this, &GlomBakery::AppWindow_WithDoc::on_menu_file_open));
+ 
++  //Migrate an old self-hosted PostgreSQL database to the bundled PostgreSQL 18.
++  //Registered in all builds, because the menu references file.migrate unconditionally.
++  m_action_group_file->add_action("migrate",
++    sigc::mem_fun(*this, &AppWindow::on_menu_file_migrate));
++
+   Glib::RefPtr<Gio::SimpleAction> action;
+ #ifndef GLOM_ENABLE_CLIENT_ONLY
+   action = m_action_group_file->add_action("save-as-example",
+@@ -306,6 +315,176 @@
+   insert_action_group("file", m_action_group_file);
+ }
+ 
++void AppWindow::on_menu_file_migrate()
++{
++  Gtk::FileChooserDialog dialog(*this, _("Select the Glom Database to Migrate"));
++  dialog.set_transient_for(*this);
++  dialog.set_modal(true);
++  dialog.add_button(_("_Cancel"), Gtk::RESPONSE_CANCEL);
++  dialog.add_button(_("_Migrate"), Gtk::RESPONSE_OK);
++  dialog.set_default_response(Gtk::RESPONSE_OK);
++
++  auto filter = Gtk::FileFilter::create();
++  filter->add_mime_type("application/x-glom");
++  filter->add_pattern("*.glom");
++  filter->set_name(_("Glom files"));
++  dialog.add_filter(filter);
++
++  if(dialog.run() != Gtk::RESPONSE_OK)
++    return;
++  const std::string glom_path = dialog.get_filename();
++  dialog.hide();
++  if(glom_path.empty())
++    return;
++
++  const bool at_welcome = (get_document() && get_document()->get_is_new());
++
++  const std::string base_dir = Glib::path_get_dirname(glom_path);
++  const std::string version_file =
++    Glib::build_filename(base_dir, "glom_postgres_data", "data", "PG_VERSION");
++
++  if(!Glib::file_test(version_file, Glib::FILE_TEST_EXISTS))
++  {
++    Gtk::MessageDialog d(*this,
++      _("This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."),
++      false, Gtk::MESSAGE_WARNING, Gtk::BUTTONS_OK, true);
++    d.set_title(_("Not a Self-Hosted Database"));
++    d.run();
++    return;
++  }
++
++  std::string cluster_version;
++  try
++  {
++    cluster_version = Glib::file_get_contents(version_file);
++  }
++  catch(const Glib::Error& ex)
++  {
++    Gtk::MessageDialog d(*this, ex.what(),
++      false, Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
++    d.set_title(_("Cannot Read Database Version"));
++    d.run();
++    return;
++  }
++  while(!cluster_version.empty() &&
++    (cluster_version.back() == '\n' || cluster_version.back() == '\r' ||
++     cluster_version.back() == ' '  || cluster_version.back() == '\t'))
++    cluster_version.pop_back();
++
++  if(cluster_version == "18")
++  {
++    if(at_welcome)
++    {
++      Gtk::MessageDialog d(*this,
++        _("This database already uses PostgreSQL 18."),
++        false, Gtk::MESSAGE_INFO, Gtk::BUTTONS_OK, true);
++      d.set_title(_("Already PostgreSQL 18"));
++      d.run();
++    }
++    else
++    {
++      Gtk::MessageDialog d(*this,
++        _("This database already uses PostgreSQL 18. Do you want to open it?"),
++        false, Gtk::MESSAGE_INFO, Gtk::BUTTONS_NONE, true);
++      d.set_title(_("Already PostgreSQL 18"));
++      d.add_button(_("_Close"), Gtk::RESPONSE_CANCEL);
++      d.add_button(_("_Open"),  Gtk::RESPONSE_ACCEPT);
++      d.set_default_response(Gtk::RESPONSE_ACCEPT);
++      if(d.run() == Gtk::RESPONSE_ACCEPT)
++        open_document(Glib::filename_to_uri(glom_path));
++    }
++    return;
++  }
++
++  {
++    Gtk::MessageDialog d(*this,
++      Glib::ustring::compose(
++        _("The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"),
++        Glib::path_get_basename(base_dir), cluster_version),
++      false, Gtk::MESSAGE_QUESTION, Gtk::BUTTONS_NONE, true);
++    d.set_title(_("Migrate to PostgreSQL 18"));
++    d.add_button(_("_Cancel"),  Gtk::RESPONSE_CANCEL);
++    d.add_button(_("_Migrate"), Gtk::RESPONSE_ACCEPT);
++    d.set_default_response(Gtk::RESPONSE_ACCEPT);
++    if(d.run() != Gtk::RESPONSE_ACCEPT)
++      return;
++  }
++
++#if defined(POSTGRES_UTILS_PATH) && !defined(G_OS_WIN32)
++  const std::string pg_bin = POSTGRES_UTILS_PATH;
++#else
++  const std::string pg_bin;
++#endif
++  const std::string script = Glib::build_filename(pg_bin, "glom-pg-migrate.sh");
++  if(pg_bin.empty() || !Glib::file_test(script, Glib::FILE_TEST_EXISTS))
++  {
++    Gtk::MessageDialog d(*this,
++      Glib::ustring::compose(_("The migration tool was not found:\n%1"), script),
++      false, Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
++    d.set_title(_("Migration Tool Not Found"));
++    d.run();
++    return;
++  }
++
++  auto sq = [](const std::string& s) -> std::string
++  {
++    char* q = g_shell_quote(s.c_str());
++    const std::string r = q ? q : std::string();
++    g_free(q);
++    return r;
++  };
++
++  const std::string command =
++    "/bin/bash " + sq(script) +
++    " --run --new-bindir=" + sq(pg_bin) +
++    " " + sq(base_dir);
++
++  const Glom::Spawn::SlotProgress slot_progress = []()
++  {
++    auto context = Glib::MainContext::get_default();
++    while(context->pending())
++      context->iteration(false);
++  };
++
++  std::string output;
++  const bool ok =
++    Glom::Spawn::execute_command_line_and_wait(command, slot_progress, output);
++
++  if(ok)
++  {
++    if(at_welcome)
++    {
++      Gtk::MessageDialog d(*this,
++        _("The database was migrated to PostgreSQL 18. You can open it now."),
++        false, Gtk::MESSAGE_INFO, Gtk::BUTTONS_OK, true);
++      d.set_title(_("Migration Complete"));
++      d.run();
++    }
++    else
++    {
++      Gtk::MessageDialog d(*this,
++        _("The database was migrated to PostgreSQL 18. Open it now?"),
++        false, Gtk::MESSAGE_INFO, Gtk::BUTTONS_NONE, true);
++      d.set_title(_("Migration Complete"));
++      d.add_button(_("_Close"), Gtk::RESPONSE_CANCEL);
++      d.add_button(_("_Open"),  Gtk::RESPONSE_ACCEPT);
++      d.set_default_response(Gtk::RESPONSE_ACCEPT);
++      if(d.run() == Gtk::RESPONSE_ACCEPT)
++        open_document(Glib::filename_to_uri(glom_path));
++    }
++  }
++  else
++  {
++    Gtk::MessageDialog d(*this,
++      _("The migration did not complete. The database was not changed."),
++      false, Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
++    d.set_title(_("Migration Failed"));
++    if(!output.empty())
++      d.set_secondary_text(output);
++    d.run();
++  }
++}
++
+ void AppWindow::init_menus()
+ {
+   init_menus_file();
+--- data/ui/operator/window_main.glade	2026-10-24 17:34:24.523011646 +0000
++++ data/ui/operator/window_main.glade	2026-10-24 17:34:24.585011646 +0000
+@@ -171,6 +171,12 @@
+       </section>
+       <section>
+         <item>
++          <attribute name="label" translatable="yes">_Migrate a Database…</attribute>
++          <attribute name="action">file.migrate</attribute>
++        </item>
++      </section>
++      <section>
++        <item>
+           <attribute name="label" translatable="yes">_Export</attribute>
+           <attribute name="action">file.export</attribute>
+         </item>
+--- po/fr.po	2026-10-24 17:34:24.526011646 +0000
++++ po/fr.po	2026-10-24 17:34:24.586011646 +0000
+@@ -4371,3 +4371,71 @@
+ msgid "<b>Users</b>"
+ msgstr "<b>Utilisateurs</b>"
+ 
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Migrer une base de données…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Sélectionner la base de données Glom à migrer"
++
++msgid "_Migrate"
++msgstr "_Migrer"
++
++msgid "_Cancel"
++msgstr "A_nnuler"
++
++msgid "_Open"
++msgstr "_Ouvrir"
++
++msgid "_Close"
++msgstr "_Fermer"
++
++msgid "Glom files"
++msgstr "Fichiers Glom"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Ce fichier Glom n'a pas de base de données PostgreSQL auto-hébergée à côté de lui, il n'y a donc rien à migrer."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Pas une base auto-hébergée"
++
++msgid "Cannot Read Database Version"
++msgstr "Lecture de la version impossible"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Cette base utilise déjà PostgreSQL 18. Voulez-vous l'ouvrir ?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Cette base utilise déjà PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Déjà en PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "La base « %1 » utilise actuellement PostgreSQL %2.\n\nElle va être migrée vers PostgreSQL 18. Une sauvegarde de l'ancienne base est conservée à côté, et la base n'est pas modifiée tant que la migration n'a pas réussi.\n\nMigrer maintenant ?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Migrer vers PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "L'outil de migration est introuvable :\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Outil de migration introuvable"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "La base a été migrée vers PostgreSQL 18. L'ouvrir maintenant ?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "La base a été migrée vers PostgreSQL 18. Vous pouvez l'ouvrir maintenant."
++
++msgid "Migration Complete"
++msgstr "Migration terminée"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "La migration n'a pas abouti. La base n'a pas été modifiée."
++
++msgid "Migration Failed"
++msgstr "Échec de la migration"
++
+--- po/de.po	2026-10-24 17:34:24.529011646 +0000
++++ po/de.po	2026-10-24 17:34:24.587011646 +0000
+@@ -4927,3 +4927,62 @@
+ 
+ #~ msgid "Creating Glom Database"
+ #~ msgstr "Glom-Datenbank wird erstellt"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Datenbank migrieren…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Zu migrierende Glom-Datenbank auswählen"
++
++msgid "_Migrate"
++msgstr "_Migrieren"
++
++msgid "Glom files"
++msgstr "Glom-Dateien"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Neben dieser Glom-Datei befindet sich keine selbstgehostete PostgreSQL-Datenbank, es gibt also nichts zu migrieren."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Keine selbstgehostete Datenbank"
++
++msgid "Cannot Read Database Version"
++msgstr "Datenbankversion kann nicht gelesen werden"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Diese Datenbank verwendet bereits PostgreSQL 18. Möchten Sie sie öffnen?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Diese Datenbank verwendet bereits PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Bereits PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "Die Datenbank „%1“ verwendet derzeit PostgreSQL %2.\n\nSie wird auf PostgreSQL 18 migriert. Eine Sicherung der alten Datenbank wird daneben aufbewahrt, und die Datenbank wird erst geändert, wenn die Migration erfolgreich war.\n\nJetzt migrieren?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Zu PostgreSQL 18 migrieren"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Das Migrationswerkzeug wurde nicht gefunden:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Migrationswerkzeug nicht gefunden"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "Die Datenbank wurde auf PostgreSQL 18 migriert. Jetzt öffnen?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "Die Datenbank wurde auf PostgreSQL 18 migriert. Sie können sie jetzt öffnen."
++
++msgid "Migration Complete"
++msgstr "Migration abgeschlossen"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "Die Migration wurde nicht abgeschlossen. Die Datenbank wurde nicht geändert."
++
++msgid "Migration Failed"
++msgstr "Migration fehlgeschlagen"
++
+--- po/nl.po	2026-10-24 17:34:24.531011646 +0000
++++ po/nl.po	2026-10-24 17:34:24.587011646 +0000
+@@ -343,3 +343,71 @@
+ 
+ #~ msgid "<b>Groups</b>"
+ #~ msgstr "<b>Groepen</b>"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "Database _migreren…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Selecteer de te migreren Glom-database"
++
++msgid "_Migrate"
++msgstr "_Migreren"
++
++msgid "_Cancel"
++msgstr "_Annuleren"
++
++msgid "_Open"
++msgstr "_Openen"
++
++msgid "_Close"
++msgstr "_Sluiten"
++
++msgid "Glom files"
++msgstr "Glom-bestanden"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Naast dit Glom-bestand staat geen zelf-gehoste PostgreSQL-database, er is dus niets te migreren."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Geen zelf-gehoste database"
++
++msgid "Cannot Read Database Version"
++msgstr "Kan databaseversie niet lezen"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Deze database gebruikt al PostgreSQL 18. Wilt u deze openen?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Deze database gebruikt al PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Al PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "De database ‘%1’ gebruikt momenteel PostgreSQL %2.\n\nDeze wordt gemigreerd naar PostgreSQL 18. Een back-up van de oude database wordt ernaast bewaard, en de database wordt pas gewijzigd wanneer de migratie is gelukt.\n\nNu migreren?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Migreren naar PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Het migratiehulpmiddel is niet gevonden:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Migratiehulpmiddel niet gevonden"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "De database is gemigreerd naar PostgreSQL 18. Nu openen?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "De database is gemigreerd naar PostgreSQL 18. U kunt deze nu openen."
++
++msgid "Migration Complete"
++msgstr "Migratie voltooid"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "De migratie is niet voltooid. De database is niet gewijzigd."
++
++msgid "Migration Failed"
++msgstr "Migratie mislukt"
++
+--- po/sv.po	2026-10-24 17:34:24.534011646 +0000
++++ po/sv.po	2026-10-24 17:34:24.588011646 +0000
+@@ -6875,3 +6875,62 @@
+ 
+ #~ msgid "%s: not implemented"
+ #~ msgstr "%s: inte implementerat"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Migrera en databas…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Välj Glom-databasen att migrera"
++
++msgid "_Migrate"
++msgstr "_Migrera"
++
++msgid "Glom files"
++msgstr "Glom-filer"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Det finns ingen självvärdad PostgreSQL-databas bredvid den här Glom-filen, så det finns inget att migrera."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Ingen självvärdad databas"
++
++msgid "Cannot Read Database Version"
++msgstr "Kan inte läsa databasversion"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Denna databas använder redan PostgreSQL 18. Vill du öppna den?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Denna databas använder redan PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Redan PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "Databasen ”%1” använder för närvarande PostgreSQL %2.\n\nDen kommer att migreras till PostgreSQL 18. En säkerhetskopia av den gamla databasen behålls bredvid, och databasen ändras inte förrän migreringen lyckats.\n\nMigrera nu?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Migrera till PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Migreringsverktyget hittades inte:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Migreringsverktyget hittades inte"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "Databasen migrerades till PostgreSQL 18. Öppna den nu?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "Databasen migrerades till PostgreSQL 18. Du kan öppna den nu."
++
++msgid "Migration Complete"
++msgstr "Migrering slutförd"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "Migreringen slutfördes inte. Databasen ändrades inte."
++
++msgid "Migration Failed"
++msgstr "Migrering misslyckades"
++
+--- po/da.po	2026-10-24 17:34:24.536011646 +0000
++++ po/da.po	2026-10-24 17:34:24.589011646 +0000
+@@ -4942,3 +4942,62 @@
+ 
+ #~ msgid "Mode:"
+ #~ msgstr "Tilstand:"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Migrér en database…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Vælg den Glom-database, der skal migreres"
++
++msgid "_Migrate"
++msgstr "_Migrér"
++
++msgid "Glom files"
++msgstr "Glom-filer"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Der er ingen selvhostet PostgreSQL-database ved siden af denne Glom-fil, så der er intet at migrere."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Ikke en selvhostet database"
++
++msgid "Cannot Read Database Version"
++msgstr "Kan ikke læse databaseversion"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Denne database bruger allerede PostgreSQL 18. Vil du åbne den?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Denne database bruger allerede PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Allerede PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "Databasen »%1« bruger i øjeblikket PostgreSQL %2.\n\nDen vil blive migreret til PostgreSQL 18. En sikkerhedskopi af den gamle database bevares ved siden af, og databasen ændres først, når migreringen er lykkedes.\n\nMigrér nu?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Migrér til PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Migreringsværktøjet blev ikke fundet:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Migreringsværktøjet blev ikke fundet"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "Databasen blev migreret til PostgreSQL 18. Åbn den nu?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "Databasen blev migreret til PostgreSQL 18. Du kan åbne den nu."
++
++msgid "Migration Complete"
++msgstr "Migrering fuldført"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "Migreringen blev ikke fuldført. Databasen blev ikke ændret."
++
++msgid "Migration Failed"
++msgstr "Migrering mislykkedes"
++
+--- po/nb.po	2026-10-24 17:34:24.539011646 +0000
++++ po/nb.po	2026-10-24 17:34:24.590011646 +0000
+@@ -4027,3 +4027,71 @@
+ #: ../ui/developer/window_users.glade.h:3
+ msgid "<b>Users</b>"
+ msgstr "<b>Brukere</b>"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Migrer en database…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Velg Glom-databasen som skal migreres"
++
++msgid "_Migrate"
++msgstr "_Migrer"
++
++msgid "_Cancel"
++msgstr "A_vbryt"
++
++msgid "_Open"
++msgstr "_Åpne"
++
++msgid "_Close"
++msgstr "_Lukk"
++
++msgid "Glom files"
++msgstr "Glom-filer"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Det finnes ingen selvvertet PostgreSQL-database ved siden av denne Glom-filen, så det er ingenting å migrere."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Ikke en selvvertet database"
++
++msgid "Cannot Read Database Version"
++msgstr "Kan ikke lese databaseversjon"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Denne databasen bruker allerede PostgreSQL 18. Vil du åpne den?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Denne databasen bruker allerede PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Allerede PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "Databasen «%1» bruker for øyeblikket PostgreSQL %2.\n\nDen vil bli migrert til PostgreSQL 18. En sikkerhetskopi av den gamle databasen beholdes ved siden av, og databasen endres ikke før migreringen er vellykket.\n\nMigrere nå?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Migrer til PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Migreringsverktøyet ble ikke funnet:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Migreringsverktøyet ble ikke funnet"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "Databasen ble migrert til PostgreSQL 18. Åpne den nå?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "Databasen ble migrert til PostgreSQL 18. Du kan åpne den nå."
++
++msgid "Migration Complete"
++msgstr "Migrering fullført"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "Migreringen ble ikke fullført. Databasen ble ikke endret."
++
++msgid "Migration Failed"
++msgstr "Migrering mislyktes"
++
+--- po/it.po	2026-10-24 17:34:24.541011646 +0000
++++ po/it.po	2026-10-24 17:34:24.590011646 +0000
+@@ -493,3 +493,71 @@
+ 
+ #~ msgid "Choose columns"
+ #~ msgstr "Scegli colonne"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Migra un database…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Seleziona il database Glom da migrare"
++
++msgid "_Migrate"
++msgstr "_Migra"
++
++msgid "_Cancel"
++msgstr "A_nnulla"
++
++msgid "_Open"
++msgstr "_Apri"
++
++msgid "_Close"
++msgstr "_Chiudi"
++
++msgid "Glom files"
++msgstr "File Glom"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Accanto a questo file Glom non è presente alcun database PostgreSQL self-hosted, quindi non c'è nulla da migrare."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Non è un database self-hosted"
++
++msgid "Cannot Read Database Version"
++msgstr "Impossibile leggere la versione del database"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Questo database utilizza già PostgreSQL 18. Vuoi aprirlo?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Questo database utilizza già PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Già PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "Il database «%1» utilizza attualmente PostgreSQL %2.\n\nVerrà migrato a PostgreSQL 18. Una copia di backup del vecchio database viene conservata accanto, e il database non viene modificato finché la migrazione non riesce.\n\nMigrare ora?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Migra a PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Strumento di migrazione non trovato:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Strumento di migrazione non trovato"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "Il database è stato migrato a PostgreSQL 18. Aprirlo ora?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "Il database è stato migrato a PostgreSQL 18. Puoi aprirlo ora."
++
++msgid "Migration Complete"
++msgstr "Migrazione completata"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "La migrazione non è stata completata. Il database non è stato modificato."
++
++msgid "Migration Failed"
++msgstr "Migrazione non riuscita"
++
+--- po/es.po	2026-10-24 17:34:24.544011646 +0000
++++ po/es.po	2026-10-24 17:34:24.591011646 +0000
+@@ -5190,3 +5190,62 @@
+ 
+ #~ msgid "Import _Into Table"
+ #~ msgstr "_Importar en una tabla"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Migrar una base de datos…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Seleccione la base de datos Glom que migrar"
++
++msgid "_Migrate"
++msgstr "_Migrar"
++
++msgid "Glom files"
++msgstr "Archivos Glom"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Junto a este archivo Glom no hay ninguna base de datos PostgreSQL autoalojada, así que no hay nada que migrar."
++
++msgid "Not a Self-Hosted Database"
++msgstr "No es una base de datos autoalojada"
++
++msgid "Cannot Read Database Version"
++msgstr "No se puede leer la versión de la base de datos"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Esta base de datos ya usa PostgreSQL 18. ¿Quiere abrirla?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Esta base de datos ya usa PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Ya usa PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "La base de datos «%1» usa actualmente PostgreSQL %2.\n\nSe migrará a PostgreSQL 18. Se conserva al lado una copia de seguridad de la base de datos antigua, y la base de datos no se modifica hasta que la migración se complete correctamente.\n\n¿Migrar ahora?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Migrar a PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "No se encontró la herramienta de migración:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Herramienta de migración no encontrada"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "La base de datos se migró a PostgreSQL 18. ¿Abrirla ahora?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "La base de datos se migró a PostgreSQL 18. Ya puede abrirla."
++
++msgid "Migration Complete"
++msgstr "Migración completada"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "La migración no se completó. La base de datos no se modificó."
++
++msgid "Migration Failed"
++msgstr "Falló la migración"
++
+--- po/pt.po	2026-10-24 17:34:24.546011646 +0000
++++ po/pt.po	2026-10-24 17:34:24.591011646 +0000
+@@ -5085,3 +5085,62 @@
+ 
+ #~ msgid "Some help text."
+ #~ msgstr "Algum texto de ajuda"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Migrar uma base de dados…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Selecione a base de dados Glom a migrar"
++
++msgid "_Migrate"
++msgstr "_Migrar"
++
++msgid "Glom files"
++msgstr "Ficheiros Glom"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Não existe nenhuma base de dados PostgreSQL auto-alojada ao lado deste ficheiro Glom, por isso não há nada a migrar."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Não é uma base de dados auto-alojada"
++
++msgid "Cannot Read Database Version"
++msgstr "Não é possível ler a versão da base de dados"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Esta base de dados já utiliza o PostgreSQL 18. Pretende abri-la?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Esta base de dados já utiliza o PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Já utiliza o PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "A base de dados «%1» utiliza atualmente o PostgreSQL %2.\n\nSerá migrada para o PostgreSQL 18. É mantida uma cópia de segurança da base de dados antiga ao lado, e a base de dados não é alterada até a migração ser concluída com êxito.\n\nMigrar agora?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Migrar para o PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "A ferramenta de migração não foi encontrada:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Ferramenta de migração não encontrada"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "A base de dados foi migrada para o PostgreSQL 18. Abri-la agora?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "A base de dados foi migrada para o PostgreSQL 18. Já pode abri-la."
++
++msgid "Migration Complete"
++msgstr "Migração concluída"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "A migração não foi concluída. A base de dados não foi alterada."
++
++msgid "Migration Failed"
++msgstr "A migração falhou"
++
+--- po/ro.po	2026-10-24 17:34:24.549011646 +0000
++++ po/ro.po	2026-10-24 17:34:24.592011646 +0000
+@@ -4369,3 +4369,62 @@
+ #: ../data/ui/developer/window_users.glade.h:10
+ msgid "<b>Users</b>"
+ msgstr ""
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Migrează o bază de date…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Selectați baza de date Glom de migrat"
++
++msgid "_Migrate"
++msgstr "_Migrează"
++
++msgid "Glom files"
++msgstr "Fișiere Glom"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Lângă acest fișier Glom nu există nicio bază de date PostgreSQL auto-găzduită, așa că nu este nimic de migrat."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Nu este o bază de date auto-găzduită"
++
++msgid "Cannot Read Database Version"
++msgstr "Nu se poate citi versiunea bazei de date"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Această bază de date folosește deja PostgreSQL 18. Doriți să o deschideți?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Această bază de date folosește deja PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Deja PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "Baza de date „%1” folosește în prezent PostgreSQL %2.\n\nVa fi migrată la PostgreSQL 18. O copie de rezervă a bazei de date vechi este păstrată alături, iar baza de date nu este modificată până când migrarea nu reușește.\n\nMigrați acum?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Migrează la PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Unealta de migrare nu a fost găsită:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Unealta de migrare nu a fost găsită"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "Baza de date a fost migrată la PostgreSQL 18. O deschideți acum?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "Baza de date a fost migrată la PostgreSQL 18. O puteți deschide acum."
++
++msgid "Migration Complete"
++msgstr "Migrare finalizată"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "Migrarea nu a fost finalizată. Baza de date nu a fost modificată."
++
++msgid "Migration Failed"
++msgstr "Migrarea a eșuat"
++
+--- po/pl.po	2026-10-24 17:34:24.551011646 +0000
++++ po/pl.po	2026-10-24 17:34:24.593011646 +0000
+@@ -4698,3 +4698,62 @@
+ #: ../data/ui/developer/window_users.glade.h:10
+ msgid "<b>Users</b>"
+ msgstr "<b>Użytkownicy</b>"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Migruj bazę danych…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Wybierz bazę danych Glom do migracji"
++
++msgid "_Migrate"
++msgstr "_Migruj"
++
++msgid "Glom files"
++msgstr "Pliki Glom"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Obok tego pliku Glom nie ma samodzielnie hostowanej bazy danych PostgreSQL, więc nie ma czego migrować."
++
++msgid "Not a Self-Hosted Database"
++msgstr "To nie jest samodzielnie hostowana baza danych"
++
++msgid "Cannot Read Database Version"
++msgstr "Nie można odczytać wersji bazy danych"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Ta baza danych używa już PostgreSQL 18. Czy chcesz ją otworzyć?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Ta baza danych używa już PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Już PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "Baza danych „%1” używa obecnie PostgreSQL %2.\n\nZostanie zmigrowana do PostgreSQL 18. Kopia zapasowa starej bazy danych jest przechowywana obok, a baza danych nie jest zmieniana, dopóki migracja się nie powiedzie.\n\nMigrować teraz?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Migruj do PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Nie znaleziono narzędzia migracji:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Nie znaleziono narzędzia migracji"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "Baza danych została zmigrowana do PostgreSQL 18. Otworzyć ją teraz?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "Baza danych została zmigrowana do PostgreSQL 18. Możesz ją teraz otworzyć."
++
++msgid "Migration Complete"
++msgstr "Migracja ukończona"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "Migracja nie została ukończona. Baza danych nie została zmieniona."
++
++msgid "Migration Failed"
++msgstr "Migracja się nie powiodła"
++
+--- po/ru.po	2026-10-24 17:34:24.553011646 +0000
++++ po/ru.po	2026-10-24 17:34:24.594011646 +0000
+@@ -3544,3 +3544,71 @@
+ 
+ #~ msgid "Ellipsize Headers"
+ #~ msgstr "Многоточия в заголовках"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Миграция базы данных…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Выберите базу данных Glom для миграции"
++
++msgid "_Migrate"
++msgstr "_Мигрировать"
++
++msgid "_Cancel"
++msgstr "О_тмена"
++
++msgid "_Open"
++msgstr "_Открыть"
++
++msgid "_Close"
++msgstr "_Закрыть"
++
++msgid "Glom files"
++msgstr "Файлы Glom"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Рядом с этим файлом Glom нет самостоятельно размещённой базы данных PostgreSQL, поэтому мигрировать нечего."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Не самостоятельно размещённая база данных"
++
++msgid "Cannot Read Database Version"
++msgstr "Не удалось прочитать версию базы данных"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Эта база данных уже использует PostgreSQL 18. Открыть её?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Эта база данных уже использует PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Уже PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "База данных «%1» сейчас использует PostgreSQL %2.\n\nОна будет перенесена на PostgreSQL 18. Рядом сохраняется резервная копия старой базы данных, и база данных не изменяется, пока миграция не завершится успешно.\n\nМигрировать сейчас?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Мигрировать на PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Инструмент миграции не найден:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Инструмент миграции не найден"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "База данных перенесена на PostgreSQL 18. Открыть её сейчас?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "База данных перенесена на PostgreSQL 18. Теперь её можно открыть."
++
++msgid "Migration Complete"
++msgstr "Миграция завершена"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "Миграция не завершена. База данных не изменена."
++
++msgid "Migration Failed"
++msgstr "Не удалось выполнить миграцию"
++
+--- po/fi.po	2026-10-24 17:34:24.556011646 +0000
++++ po/fi.po	2026-10-24 17:34:24.594011646 +0000
+@@ -4822,3 +4822,62 @@
+ #: ../data/ui/developer/window_users.glade.h:3
+ msgid "<b>Users</b>"
+ msgstr "<b>Käyttäjät</b>"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Siirrä tietokanta…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Valitse siirrettävä Glom-tietokanta"
++
++msgid "_Migrate"
++msgstr "_Siirrä"
++
++msgid "Glom files"
++msgstr "Glom-tiedostot"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Tämän Glom-tiedoston vieressä ei ole itse ylläpidettyä PostgreSQL-tietokantaa, joten siirrettävää ei ole."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Ei itse ylläpidetty tietokanta"
++
++msgid "Cannot Read Database Version"
++msgstr "Tietokantaversiota ei voi lukea"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Tämä tietokanta käyttää jo PostgreSQL 18:aa. Haluatko avata sen?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Tämä tietokanta käyttää jo PostgreSQL 18:aa."
++
++msgid "Already PostgreSQL 18"
++msgstr "Jo PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "Tietokanta ”%1” käyttää tällä hetkellä PostgreSQL %2:ta.\n\nSe siirretään PostgreSQL 18:aan. Vanhasta tietokannasta säilytetään varmuuskopio vieressä, eikä tietokantaa muuteta ennen kuin siirto onnistuu.\n\nSiirrä nyt?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Siirrä PostgreSQL 18:aan"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Siirtotyökalua ei löytynyt:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Siirtotyökalua ei löytynyt"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "Tietokanta siirrettiin PostgreSQL 18:aan. Avataanko se nyt?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "Tietokanta siirrettiin PostgreSQL 18:aan. Voit avata sen nyt."
++
++msgid "Migration Complete"
++msgstr "Siirto valmis"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "Siirtoa ei saatu valmiiksi. Tietokantaa ei muutettu."
++
++msgid "Migration Failed"
++msgstr "Siirto epäonnistui"
++
+--- po/hu.po	2026-10-24 17:34:24.558011646 +0000
++++ po/hu.po	2026-10-24 17:34:24.595011646 +0000
+@@ -4979,3 +4979,62 @@
+ 
+ #~ msgid "Image loading failed"
+ #~ msgstr "A kép betöltése sikertelen"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "Adatbázis _migrálása…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Válassza ki a migrálandó Glom-adatbázist"
++
++msgid "_Migrate"
++msgstr "_Migrálás"
++
++msgid "Glom files"
++msgstr "Glom-fájlok"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "E Glom-fájl mellett nincs saját üzemeltetésű PostgreSQL-adatbázis, így nincs mit migrálni."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Nem saját üzemeltetésű adatbázis"
++
++msgid "Cannot Read Database Version"
++msgstr "Az adatbázis verziója nem olvasható"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Ez az adatbázis már PostgreSQL 18-at használ. Meg szeretné nyitni?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Ez az adatbázis már PostgreSQL 18-at használ."
++
++msgid "Already PostgreSQL 18"
++msgstr "Már PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "A(z) „%1” adatbázis jelenleg PostgreSQL %2 verziót használ.\n\nÁtmigrálásra kerül PostgreSQL 18-ra. A régi adatbázisról biztonsági mentés marad mellette, és az adatbázis nem módosul, amíg a migrálás sikeresen be nem fejeződik.\n\nMigrálás most?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Migrálás PostgreSQL 18-ra"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "A migrálási eszköz nem található:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "A migrálási eszköz nem található"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "Az adatbázis átmigrálva PostgreSQL 18-ra. Megnyitja most?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "Az adatbázis átmigrálva PostgreSQL 18-ra. Most már megnyithatja."
++
++msgid "Migration Complete"
++msgstr "Migrálás kész"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "A migrálás nem fejeződött be. Az adatbázis nem módosult."
++
++msgid "Migration Failed"
++msgstr "A migrálás sikertelen"
++
+--- po/zh_CN.po	2026-10-24 17:34:24.561011646 +0000
++++ po/zh_CN.po	2026-10-24 17:34:24.596011646 +0000
+@@ -4108,3 +4108,71 @@
+ #: ../ui/developer/window_users.glade.h:2
+ msgid "<b>Users</b>"
+ msgstr "<b>用户</b>"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "迁移数据库(_M)…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "选择要迁移的 Glom 数据库"
++
++msgid "_Migrate"
++msgstr "迁移(_M)"
++
++msgid "_Cancel"
++msgstr "取消(_C)"
++
++msgid "_Open"
++msgstr "打开(_O)"
++
++msgid "_Close"
++msgstr "关闭(_C)"
++
++msgid "Glom files"
++msgstr "Glom 文件"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "此 Glom 文件旁边没有自托管的 PostgreSQL 数据库，因此没有可迁移的内容。"
++
++msgid "Not a Self-Hosted Database"
++msgstr "不是自托管数据库"
++
++msgid "Cannot Read Database Version"
++msgstr "无法读取数据库版本"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "此数据库已使用 PostgreSQL 18。要打开它吗？"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "此数据库已使用 PostgreSQL 18。"
++
++msgid "Already PostgreSQL 18"
++msgstr "已是 PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "数据库“%1”当前使用 PostgreSQL %2。\n\n它将被迁移到 PostgreSQL 18。旧数据库的备份会保留在旁边，在迁移成功之前数据库不会被更改。\n\n现在迁移吗？"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "迁移到 PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "未找到迁移工具：\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "未找到迁移工具"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "数据库已迁移到 PostgreSQL 18。现在打开它吗？"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "数据库已迁移到 PostgreSQL 18。您现在可以打开它。"
++
++msgid "Migration Complete"
++msgstr "迁移完成"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "迁移未完成。数据库未被更改。"
++
++msgid "Migration Failed"
++msgstr "迁移失败"
++
+--- po/ar.po	2026-10-24 17:34:24.563011646 +0000
++++ po/ar.po	2026-10-24 17:34:24.597011646 +0000
+@@ -3603,3 +3603,71 @@
+ #, fuzzy
+ #~ msgid "Choose columns"
+ #~ msgstr "اختر الأعمدة"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_ترحيل قاعدة بيانات…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "اختر قاعدة بيانات Glom المراد ترحيلها"
++
++msgid "_Migrate"
++msgstr "_ترحيل"
++
++msgid "_Cancel"
++msgstr "إ_لغاء"
++
++msgid "_Open"
++msgstr "_فتح"
++
++msgid "_Close"
++msgstr "إ_غلاق"
++
++msgid "Glom files"
++msgstr "ملفات Glom"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "لا توجد قاعدة بيانات PostgreSQL ذاتية الاستضافة بجوار ملف Glom هذا، لذا لا يوجد ما يُرحَّل."
++
++msgid "Not a Self-Hosted Database"
++msgstr "ليست قاعدة بيانات ذاتية الاستضافة"
++
++msgid "Cannot Read Database Version"
++msgstr "تعذّر قراءة إصدار قاعدة البيانات"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "تستخدم قاعدة البيانات هذه بالفعل PostgreSQL 18. هل تريد فتحها؟"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "تستخدم قاعدة البيانات هذه بالفعل PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "بالفعل PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "تستخدم قاعدة البيانات «%1» حاليًا PostgreSQL %2.\n\nسيتم ترحيلها إلى PostgreSQL 18. يُحتفظ بنسخة احتياطية من قاعدة البيانات القديمة بجوارها، ولا تُعدَّل قاعدة البيانات حتى ينجح الترحيل.\n\nهل تريد الترحيل الآن؟"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "الترحيل إلى PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "لم يُعثر على أداة الترحيل:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "لم يُعثر على أداة الترحيل"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "تم ترحيل قاعدة البيانات إلى PostgreSQL 18. هل تريد فتحها الآن؟"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "تم ترحيل قاعدة البيانات إلى PostgreSQL 18. يمكنك فتحها الآن."
++
++msgid "Migration Complete"
++msgstr "اكتمل الترحيل"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "لم يكتمل الترحيل. لم تُعدَّل قاعدة البيانات."
++
++msgid "Migration Failed"
++msgstr "فشل الترحيل"
++
+--- po/tr.po	2026-10-24 17:34:24.565011646 +0000
++++ po/tr.po	2026-10-24 17:34:24.598011646 +0000
+@@ -4749,3 +4749,62 @@
+ 
+ #~ msgid "Extra"
+ #~ msgstr "Ek"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "Veritabanını _Taşı…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Taşınacak Glom veritabanını seçin"
++
++msgid "_Migrate"
++msgstr "_Taşı"
++
++msgid "Glom files"
++msgstr "Glom dosyaları"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Bu Glom dosyasının yanında kendi kendine barındırılan bir PostgreSQL veritabanı yok, bu nedenle taşınacak bir şey yok."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Kendi kendine barındırılan bir veritabanı değil"
++
++msgid "Cannot Read Database Version"
++msgstr "Veritabanı sürümü okunamıyor"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Bu veritabanı zaten PostgreSQL 18 kullanıyor. Açmak ister misiniz?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Bu veritabanı zaten PostgreSQL 18 kullanıyor."
++
++msgid "Already PostgreSQL 18"
++msgstr "Zaten PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "“%1” veritabanı şu anda PostgreSQL %2 kullanıyor.\n\nPostgreSQL 18'e taşınacak. Eski veritabanının bir yedeği yanında saklanır ve taşıma başarılı olana kadar veritabanı değiştirilmez.\n\nŞimdi taşınsın mı?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "PostgreSQL 18'e taşı"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Taşıma aracı bulunamadı:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Taşıma aracı bulunamadı"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "Veritabanı PostgreSQL 18'e taşındı. Şimdi açılsın mı?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "Veritabanı PostgreSQL 18'e taşındı. Şimdi açabilirsiniz."
++
++msgid "Migration Complete"
++msgstr "Taşıma tamamlandı"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "Taşıma tamamlanmadı. Veritabanı değiştirilmedi."
++
++msgid "Migration Failed"
++msgstr "Taşıma başarısız"
++
+--- po/el.po	2026-10-24 17:34:24.568011646 +0000
++++ po/el.po	2026-10-24 17:34:24.599011646 +0000
+@@ -4854,3 +4854,62 @@
+ #, fuzzy
+ #~ msgid "Portal"
+ #~ msgstr "Εξωτερική πύλη"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Μετεγκατάσταση βάσης δεδομένων…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Επιλέξτε τη βάση δεδομένων Glom προς μετεγκατάσταση"
++
++msgid "_Migrate"
++msgstr "_Μετεγκατάσταση"
++
++msgid "Glom files"
++msgstr "Αρχεία Glom"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Δίπλα σε αυτό το αρχείο Glom δεν υπάρχει αυτοφιλοξενούμενη βάση δεδομένων PostgreSQL, επομένως δεν υπάρχει τίποτα προς μετεγκατάσταση."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Δεν είναι αυτοφιλοξενούμενη βάση δεδομένων"
++
++msgid "Cannot Read Database Version"
++msgstr "Αδυναμία ανάγνωσης της έκδοσης της βάσης δεδομένων"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Αυτή η βάση δεδομένων χρησιμοποιεί ήδη PostgreSQL 18. Θέλετε να την ανοίξετε;"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Αυτή η βάση δεδομένων χρησιμοποιεί ήδη PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Ήδη PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "Η βάση δεδομένων «%1» χρησιμοποιεί αυτήν τη στιγμή PostgreSQL %2.\n\nΘα μετεγκατασταθεί σε PostgreSQL 18. Ένα αντίγραφο ασφαλείας της παλιάς βάσης δεδομένων διατηρείται δίπλα, και η βάση δεδομένων δεν τροποποιείται έως ότου η μετεγκατάσταση ολοκληρωθεί με επιτυχία.\n\nΜετεγκατάσταση τώρα;"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Μετεγκατάσταση σε PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Το εργαλείο μετεγκατάστασης δεν βρέθηκε:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Το εργαλείο μετεγκατάστασης δεν βρέθηκε"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "Η βάση δεδομένων μετεγκαταστάθηκε σε PostgreSQL 18. Άνοιγμα τώρα;"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "Η βάση δεδομένων μετεγκαταστάθηκε σε PostgreSQL 18. Μπορείτε να την ανοίξετε τώρα."
++
++msgid "Migration Complete"
++msgstr "Η μετεγκατάσταση ολοκληρώθηκε"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "Η μετεγκατάσταση δεν ολοκληρώθηκε. Η βάση δεδομένων δεν τροποποιήθηκε."
++
++msgid "Migration Failed"
++msgstr "Η μετεγκατάσταση απέτυχε"
++
+--- po/cs.po	2026-10-24 17:34:24.570011646 +0000
++++ po/cs.po	2026-10-24 17:34:24.599011646 +0000
+@@ -4685,3 +4685,62 @@
+ 
+ #~ msgid "No help file available"
+ #~ msgstr "Soubor nápovědy není dostupný"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Migrovat databázi…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Vyberte databázi Glom k migraci"
++
++msgid "_Migrate"
++msgstr "_Migrovat"
++
++msgid "Glom files"
++msgstr "Soubory Glom"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Vedle tohoto souboru Glom není žádná vlastně hostovaná databáze PostgreSQL, takže není co migrovat."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Není vlastně hostovaná databáze"
++
++msgid "Cannot Read Database Version"
++msgstr "Nelze přečíst verzi databáze"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Tato databáze již používá PostgreSQL 18. Chcete ji otevřít?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Tato databáze již používá PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Již PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "Databáze „%1“ aktuálně používá PostgreSQL %2.\n\nBude migrována na PostgreSQL 18. Záloha staré databáze se uchová vedle a databáze se nezmění, dokud migrace neproběhne úspěšně.\n\nMigrovat nyní?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Migrovat na PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Nástroj pro migraci nebyl nalezen:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Nástroj pro migraci nebyl nalezen"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "Databáze byla migrována na PostgreSQL 18. Otevřít ji nyní?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "Databáze byla migrována na PostgreSQL 18. Nyní ji můžete otevřít."
++
++msgid "Migration Complete"
++msgstr "Migrace dokončena"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "Migrace nebyla dokončena. Databáze nebyla změněna."
++
++msgid "Migration Failed"
++msgstr "Migrace selhala"
++
+--- po/sr.po	2026-10-24 17:34:24.573011646 +0000
++++ po/sr.po	2026-10-24 17:34:24.600011646 +0000
+@@ -4742,3 +4742,62 @@
+ 
+ #~ msgid "<b>Translations</b>"
+ #~ msgstr "<b>Преводи</b>"
++
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Пресели базу података…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Изаберите Glom базу података за пресељење"
++
++msgid "_Migrate"
++msgstr "_Пресели"
++
++msgid "Glom files"
++msgstr "Glom датотеке"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Поред ове Glom датотеке нема самостално хостоване PostgreSQL базе података, па нема шта да се пресели."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Није самостално хостована база података"
++
++msgid "Cannot Read Database Version"
++msgstr "Није могуће прочитати верзију базе података"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Ова база података већ користи PostgreSQL 18. Желите ли да је отворите?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Ова база података већ користи PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Већ PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "База података „%1“ тренутно користи PostgreSQL %2.\n\nБиће пресељена на PostgreSQL 18. Резервна копија старе базе података чува се поред, а база података се не мења док пресељење не успе.\n\nПреселити сада?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Пресели на PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Алат за пресељење није пронађен:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Алат за пресељење није пронађен"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "База података је пресељена на PostgreSQL 18. Отворити је сада?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "База података је пресељена на PostgreSQL 18. Сада можете да је отворите."
++
++msgid "Migration Complete"
++msgstr "Пресељење завршено"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "Пресељење није завршено. База података није измењена."
++
++msgid "Migration Failed"
++msgstr "Пресељење није успело"
++
+--- po/vi.po	2026-10-24 17:34:24.575011646 +0000
++++ po/vi.po	2026-10-24 17:34:24.601011646 +0000
+@@ -2022,4 +2022,71 @@
+ 
+ #: ../glom/translation/window_translations.cc:69
+ msgid "Translation"
+-msgstr "Bản dịch"
+\ No newline at end of file
++msgstr "Bản dịch"
++# Menu de migration PostgreSQL 18 (integration macOS)
++msgid "_Migrate a Database…"
++msgstr "_Di chuyển cơ sở dữ liệu…"
++
++msgid "Select the Glom Database to Migrate"
++msgstr "Chọn cơ sở dữ liệu Glom cần di chuyển"
++
++msgid "_Migrate"
++msgstr "_Di chuyển"
++
++msgid "_Cancel"
++msgstr "_Hủy"
++
++msgid "_Open"
++msgstr "_Mở"
++
++msgid "_Close"
++msgstr "Đón_g"
++
++msgid "Glom files"
++msgstr "Tập tin Glom"
++
++msgid "This Glom file has no self-hosted PostgreSQL database beside it, so there is nothing to migrate."
++msgstr "Không có cơ sở dữ liệu PostgreSQL tự lưu trữ bên cạnh tập tin Glom này, nên không có gì để di chuyển."
++
++msgid "Not a Self-Hosted Database"
++msgstr "Không phải cơ sở dữ liệu tự lưu trữ"
++
++msgid "Cannot Read Database Version"
++msgstr "Không thể đọc phiên bản cơ sở dữ liệu"
++
++msgid "This database already uses PostgreSQL 18. Do you want to open it?"
++msgstr "Cơ sở dữ liệu này đã dùng PostgreSQL 18. Bạn có muốn mở nó không?"
++
++msgid "This database already uses PostgreSQL 18."
++msgstr "Cơ sở dữ liệu này đã dùng PostgreSQL 18."
++
++msgid "Already PostgreSQL 18"
++msgstr "Đã là PostgreSQL 18"
++
++msgid "The database \"%1\" currently uses PostgreSQL %2.\n\nIt will be migrated to PostgreSQL 18. A backup of the old database is kept beside it, and the database is not changed until the migration succeeds.\n\nMigrate now?"
++msgstr "Cơ sở dữ liệu “%1” hiện đang dùng PostgreSQL %2.\n\nNó sẽ được di chuyển sang PostgreSQL 18. Một bản sao lưu của cơ sở dữ liệu cũ được giữ bên cạnh, và cơ sở dữ liệu không bị thay đổi cho đến khi di chuyển thành công.\n\nDi chuyển ngay bây giờ?"
++
++msgid "Migrate to PostgreSQL 18"
++msgstr "Di chuyển sang PostgreSQL 18"
++
++msgid "The migration tool was not found:\n%1"
++msgstr "Không tìm thấy công cụ di chuyển:\n%1"
++
++msgid "Migration Tool Not Found"
++msgstr "Không tìm thấy công cụ di chuyển"
++
++msgid "The database was migrated to PostgreSQL 18. Open it now?"
++msgstr "Cơ sở dữ liệu đã được di chuyển sang PostgreSQL 18. Mở nó ngay bây giờ?"
++
++msgid "The database was migrated to PostgreSQL 18. You can open it now."
++msgstr "Cơ sở dữ liệu đã được di chuyển sang PostgreSQL 18. Bạn có thể mở nó ngay bây giờ."
++
++msgid "Migration Complete"
++msgstr "Di chuyển hoàn tất"
++
++msgid "The migration did not complete. The database was not changed."
++msgstr "Di chuyển chưa hoàn tất. Cơ sở dữ liệu không bị thay đổi."
++
++msgid "Migration Failed"
++msgstr "Di chuyển thất bại"
++

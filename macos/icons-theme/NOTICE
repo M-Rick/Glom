@@ -1,0 +1,17 @@
+Thème d'icônes WhiteSur
+=======================
+
+Le thème d'icônes présent dans ce dossier (Icons/, Icons-dark/, Icons-light/)
+est « WhiteSur », créé par vinceliuice.
+
+  Copyright (C) vinceliuice
+  Sous licence GNU General Public License version 3 ou ultérieure
+  (GPL-3.0-or-later). Voir le fichier LICENSE de ce dossier pour le texte
+  complet de la licence.
+
+  Source amont : https://github.com/vinceliuice/WhiteSur-icon-theme
+
+Ces fichiers sont des ressources de thème générées, redistribuées avec le
+bundle macOS de Glom afin que l'application dispose d'un jeu d'icônes de style
+macOS. Le thème complet et ses scripts de génération sont disponibles à
+l'adresse ci-dessus.

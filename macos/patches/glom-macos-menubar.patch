@@ -1,0 +1,152 @@
+--- configure.ac
++++ configure.ac
+@@ -193,6 +193,19 @@
+ 
+ PKG_CHECK_MODULES([GLOM], [$REQUIRED_GLOM_LIBS])
+ 
++dnl macOS (quartz) : integration de la barre de menus via gtk-mac-integration
++_gdk_targets=`$PKG_CONFIG --variable=targets gdk-3.0`
++case "$_gdk_targets" in
++*quartz*)
++  PKG_CHECK_MODULES([GTKMACINTEGRATION], [gtk-mac-integration-gtk3])
++  AC_DEFINE([GLOM_WITH_QUARTZ], [1],
++            [Define to integrate the menu bar with the macOS menu bar])
++  AC_MSG_NOTICE([gdk target is quartz: macOS menu integration enabled])
++  ;;
++esac
++AC_SUBST([GTKMACINTEGRATION_CFLAGS])
++AC_SUBST([GTKMACINTEGRATION_LIBS])
++
+ MM_PKG_CONFIG_SUBST([GLIB_GENMARSHAL], [--variable=glib_genmarshal glib-2.0])
+ 
+ # Get the location of the ISO-Codes (currencies, languages) files:
+--- Makefile_glom.am
++++ Makefile_glom.am
+@@ -26,7 +26,7 @@
+ 
+ bin_PROGRAMS += glom/glom
+ 
+-glom_glom_CPPFLAGS = $(glom_includes) $(GLOM_CFLAGS) $(PYTHON_CPPFLAGS) $(BOOST_PYTHON_CFLAGS) $(GCOV_CFLAGS) $(glom_defines)
++glom_glom_CPPFLAGS = $(glom_includes) $(GLOM_CFLAGS) $(PYTHON_CPPFLAGS) $(BOOST_PYTHON_CFLAGS) $(GCOV_CFLAGS) $(glom_defines) $(GTKMACINTEGRATION_CFLAGS)
+ 
+ # Generate the GResource source file for .glade and icons files:
+ # TODO: Do not use all .glade files in the client-only build.
+@@ -425,7 +425,7 @@
+ 	glom/libglom/libglom-$(GLOM_ABI_VERSION).la $(libglom_all_libs) \
+ 	$(GLOM_LIBS) $(INTLLIBS)
+ 
+-glom_glom_LDADD = $(glom_all_libs)
++glom_glom_LDADD = $(glom_all_libs) $(GTKMACINTEGRATION_LIBS)
+ 
+ if HOST_WIN32
+ # Suppress console window
+--- glom/appwindow.cc
++++ glom/appwindow.cc
+@@ -45,6 +45,27 @@
+ #include <libglom/spawn_with_feedback.h>
+ #include <giomm/menu.h>
+ 
++#ifdef GLOM_WITH_QUARTZ
++#include <gtkosxapplication.h>
++namespace
++{
++// Cmd+Q sur macOS : fermer proprement les fenetres (chacune propose
++// d'enregistrer) plutot que la terminaison brutale de Cocoa.
++gboolean glom_osx_block_termination(GtkosxApplication* /* app */, gpointer data)
++{
++  auto* appwindow = static_cast<Glom::AppWindow*>(data);
++  if(appwindow)
++  {
++    auto app = appwindow->get_application();
++    if(app)
++      for(auto* window : app->get_windows())
++        window->close();
++  }
++  return TRUE; // la terminaison est geree ci-dessus
++}
++} // anonymous namespace
++#endif // GLOM_WITH_QUARTZ
++
+ #include <gtkmm/main.h>
+ #include <gtkmm/textview.h>
+ 
+@@ -124,6 +145,25 @@
+   m_menubar->show();
+   m_box_top->pack_start(*m_menubar, Gtk::PACK_SHRINK);
+ 
++#ifdef GLOM_WITH_QUARTZ
++  // Remonter la barre de menus dans la barre macOS (recette Viking/Gnumeric).
++  {
++    GtkosxApplication* osxapp = gtkosx_application_get();
++    gtkosx_application_set_menu_bar(osxapp, GTK_MENU_SHELL(m_menubar->gobj()));
++    // Piege Viking : empecher show_all de la reafficher dans la fenetre.
++    m_menubar->set_no_show_all(true);
++    m_menubar->hide();
++    gtkosx_application_sync_menubar(osxapp);
++    static bool s_quit_connected = false;
++    if(!s_quit_connected)
++    {
++      g_signal_connect(osxapp, "NSApplicationBlockTermination",
++                       G_CALLBACK(glom_osx_block_termination), this);
++      s_quit_connected = true;
++    }
++  }
++#endif // GLOM_WITH_QUARTZ
++
+   //TODO: Remove our use of add_accelerator() in application.cc,
+   //if there is ever an easier way to make the 'accel's from the .glade file just work.
+   //See https://bugzilla.gnome.org/show_bug.cgi?id=708905
+--- glom/application.cc
++++ glom/application.cc
+@@ -18,6 +18,7 @@
+  * Boston, MA 02110-1301 USA.
+  */
+ 
++#include "config.h" // For GLOM_WITH_QUARTZ
+ #include <glom/application.h>
+ #include <glom/appwindow.h>
+ #include <glom/main_local_options.h>
+@@ -27,6 +28,23 @@
+ 
+ #include <glibmm/i18n.h>
+ 
++#ifdef GLOM_WITH_QUARTZ
++#include <gtkosxapplication.h>
++namespace
++{
++// A appeler une fois, apres la construction de la premiere fenetre.
++void glom_osx_signal_ready()
++{
++  static bool s_done = false;
++  if(!s_done)
++  {
++    gtkosx_application_ready(gtkosx_application_get());
++    s_done = true;
++  }
++}
++} // anonymous namespace
++#endif // GLOM_WITH_QUARTZ
++
+ namespace Glom
+ {
+ 
+@@ -85,6 +103,9 @@
+ 
+   // The application has been started, so let's show a window:
+   create_window();
++#ifdef GLOM_WITH_QUARTZ
++  glom_osx_signal_ready();
++#endif
+ }
+ 
+ void Application::on_startup()
+@@ -127,6 +148,9 @@
+       create_window(file);
+   }
+ 
++#ifdef GLOM_WITH_QUARTZ
++  glom_osx_signal_ready();
++#endif
+   Gtk::Application::on_open(files, hint);
+ }
+ 
