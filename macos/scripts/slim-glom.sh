@@ -45,7 +45,8 @@ done
 
 RES="$BUNDLE/Contents/Resources"
 [ -d "$RES" ] || { echo "introuvable : $RES" >&2; exit 1; }
-[ -n "$QUAR" ] || QUAR="$SCRIPT_DIR/quarantaine"
+# quarantaine HORS du depot (jamais dans scripts/) : a cote du bundle
+[ -n "$QUAR" ] || QUAR="$(dirname "$BUNDLE")/.Glom-slim-quarantaine"
 RUNAS=""; [ -w "$RES" ] || RUNAS="sudo"
 
 TMPD="$(mktemp -d "${TMPDIR:-/tmp}/slimglom.XXXXXX")"; trap 'rm -rf "$TMPD"' EXIT

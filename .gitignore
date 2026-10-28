@@ -60,3 +60,7 @@ docs/user-guide/*/*.docbook
 docs/user-guide/*/*.stamp
 
 /glom-?.*.tar.*
+.DS_Store
+*.bak*
+quarantaine/
+macos/quarantaine/
