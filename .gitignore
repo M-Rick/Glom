@@ -63,4 +63,4 @@ docs/user-guide/*/*.stamp
 .DS_Store
 *.bak*
 quarantaine/
-macos/quarantaine/
+macOS/quarantaine/
