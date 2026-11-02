@@ -40,18 +40,35 @@ sudo $macports/bin/port -v selfupdate
 
 ## 2. Correctifs (avant de construire les ports)
 
-A relancer apres chaque `selfupdate`.
+A relancer apres chaque `selfupdate`. Chaque correctif vit dans un seul fichier
+sous `patches/` (source unique, aucune copie) ; les scripts ci-dessous les
+copient dans les ports MacPorts et les cablent (`patchfiles-append`).
 
 ```
-sudo bash scripts/patch.sh $macports                 # libgda (catalogue PG moderne + dispose recordset) et glibmm
+sudo bash scripts/patch.sh $macports                 # libgda + glibmm + les 3 correctifs macOS de glom (voir la table)
 sudo PORT="$macports/bin/port" bash scripts/patch-portfiles-pg18.sh   # localise libgda5 et glom via 'port file'
 sudo bash scripts/apply-migrate-menu-patch.sh $dir   # menu Fichier > Migrate a Database + traductions (21 langues)
 sudo bash scripts/apply-setenv-patch.sh $dir         # glom : environnement C au processus enfant (setenv non thread-safe)
 sudo bash scripts/apply-libgda-xmlrow-patch.sh $dir  # libgda5 : corrige le debordement add_xml_row (plantage creation de base)
 ```
 
-Les correctifs macOS de glom (barre de menus, selecteur de fichiers, raccourcis
-Edit) sont dans `patches/` et cables dans le Portfile de glom de la meme facon.
+Qui applique quoi (chaque fichier de `patches/` a exactement un script) :
+
+| Fichier `patches/` | Applique par | Port | Role |
+|---|---|---|---|
+| `patch-glibmm-libcxx19-char-traits.diff` | `patch.sh` | glibmm | compilation libc++ 19 |
+| `patch-libgda-postgres-modern-catalog.diff` | `patch.sh` | libgda5 | catalogue PG moderne + dispose recordset |
+| `autogen.sh` | `patch.sh` | libgda5 | autogen corrige |
+| `glom-macos-menubar.patch` | `patch.sh` | glom | barre de menus macOS + garde anti-reentrance Cmd+Q |
+| `glom-macos-filechooser.patch` | `patch.sh` | glom | selecteur de fichiers |
+| `glom-accels-fix.patch` | `patch.sh` | glom | raccourcis Edit |
+| `glom-macos-migrate-menu.patch` | `apply-migrate-menu-patch.sh` | glom | menu Migrate a Database + 21 langues |
+| `glom-spawn-setenv-threadsafe.patch` | `apply-setenv-patch.sh` | glom | setenv non thread-safe (plantage creation base) |
+| `patch-libgda-xmlrow-overflow.diff` | `apply-libgda-xmlrow-patch.sh` | libgda5 | debordement add_xml_row (plantage creation base) |
+
+`patch.sh` lit ces fichiers depuis `patches/` (il ne les embarque plus en dur) :
+pour qu'un `glom` reconstruit reprenne un correctif modifie, relancer `patch.sh`
+avant de reconstruire le port.
 
 Les deux derniers (`apply-setenv`, `apply-libgda-xmlrow`) corrigent le plantage a
 la creation d'une base : un `setenv()` non thread-safe dans glom et un debordement
@@ -178,11 +195,12 @@ framework embarque suffit : tu peux supprimer `~/PostgreSQL.framework.horsjeu`.
     `apply-migrate-menu-patch.sh`, `apply-setenv-patch.sh`,
     `apply-libgda-xmlrow-patch.sh`.
   - Assemblage : `slim-glom.sh`, `finalize-glom-bundle.sh`, `make_icns.sh`, le
-    lanceur `Glom`, `Clean-Glom.sh`.
+    lanceur `Glom`.
   - Migration PostgreSQL : `install-migrate-tool.sh`, `slim-pg-framework.sh`,
     `install-pg-framework.sh`.
-  - Diagnostics : `audit-glom-bundle.sh`, `check-glom-macos-integration.sh`,
-    `glom-libgda-diagnostic.sh`, `glom-crash-backtrace.sh`.
+- `diagnostics/` : outils d'inspection hors build (`audit-glom-bundle.sh`,
+  `check-glom-macos-integration.sh`, `glom-libgda-diagnostic.sh`,
+  `glom-crash-backtrace.sh`).
 - `patches/` : correctifs libgda/glibmm et les correctifs macOS de glom
   (`glom-macos-menubar.patch`, `glom-macos-filechooser.patch`,
   `glom-accels-fix.patch`, `glom-macos-migrate-menu.patch`,
@@ -211,6 +229,11 @@ fonctionne meme sans `/Library/Frameworks`. Libelles traduits en 21 langues
   `finalize` reste la toute derniere etape.
 - Le PostgreSQL.framework systeme (`/Library/Frameworks`) n'est plus necessaire
   une fois le framework embarque et la migration validee.
+- L'app doit rester installee dans `/Applications/Glom.app`. Les install-names
+  Mach-O sont absolus (prefixe MacPorts grave en dur), donc un bundle deplace ou
+  renomme ne retrouve plus ses bibliotheques et refuse de demarrer. La conversion
+  des liens symboliques en relatif sert a la signature, elle ne rend pas pour
+  autant le bundle relocalisable.
 
 ## Licences
 

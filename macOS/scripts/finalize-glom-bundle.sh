@@ -440,6 +440,34 @@ done < <(find "$BUNDLE" \
 echo "  $n lien(s) orphelin(s)"
 
 # =============================================================================
+# 3b. Liens symboliques absolus rendus relatifs
+# =============================================================================
+hdr "3b. Liens symboliques absolus rendus relatifs"
+echo "  codesign refuse un lien dont la cible est un chemin absolu dans le"
+echo "  bundle (invalid destination for symbolic link). On les reecrit en"
+echo "  relatif : meme cible, requis pour que codesign accepte le bundle."
+echo "  (Ne rend pas le bundle deplacable : les install-names Mach-O restent"
+echo "   absolus, l'app doit vivre dans /Applications/Glom.app. Voir README.)"
+bundle_abs="$(cd "$BUNDLE" && pwd -P)"
+n=0
+while IFS= read -r l; do
+  tgt="$(readlink "$l")"
+  case "$tgt" in
+    "$bundle_abs"/*) : ;;   # cible absolue a l'interieur du bundle : a convertir
+    *) continue ;;          # relative, ou hors bundle : on ne touche pas
+  esac
+  ldir="$(dirname "$l")"
+  rel="$(perl -MFile::Spec -e 'print File::Spec->abs2rel($ARGV[0], $ARGV[1])' "$tgt" "$ldir" 2>/dev/null)" || rel=""
+  [ -n "$rel" ] || continue
+  relshow="${l#$BUNDLE/}"
+  [ "$n" -lt 20 ] && say "$relshow -> $rel"
+  [ "$n" -eq 20 ] && echo "  ... (suite masquee)"
+  act $RUNAS ln -sfn "$rel" "$l"
+  n=$((n+1))
+done < <(find "$BUNDLE" -type l 2>/dev/null)
+echo "  $n lien(s) converti(s)"
+
+# =============================================================================
 # 4. Signature
 # =============================================================================
 hdr "4. Signature"

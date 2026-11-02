@@ -64,3 +64,4 @@ docs/user-guide/*/*.stamp
 *.bak*
 quarantaine/
 macOS/quarantaine/
+.fuse_hidden*
