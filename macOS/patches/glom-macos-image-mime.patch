@@ -1,0 +1,170 @@
+--- glom/utility_widgets/imageglom.cc
++++ glom/utility_widgets/imageglom.cc
+@@ -31,6 +31,7 @@
+ #include <libglom/file_utils.h>
+ #include <gtkmm/appchooserdialog.h>
+ #include <gtkmm/filechooserdialog.h>
++#include <gdkmm/pixbufloader.h>
+ #include <giomm/contenttype.h>
+ #include <giomm/menu.h>
+ #include <libgda/gda-blob-op.h>
+@@ -300,13 +301,40 @@
+   if(!gda_binary->data)
+     return Glib::ustring();
+ 
++  // macOS (quartz) : g_content_type_guess() identifie d'apres le nom de fichier,
++  // pas d'apres les octets ; sans nom il renvoie un type generique. On identifie
++  // donc le format par GdkPixbuf sur les octets (raster + SVG).
++  try
++  {
++    auto loader = Gdk::PixbufLoader::create();
++    loader->write(gda_binary->data, gda_binary->binary_length);
++    loader->close();
++    const auto format = loader->get_format();
++    if(format.gobj())
++    {
++      const auto mime_types = format.get_mime_types();
++      if(!mime_types.empty())
++        return mime_types[0];
++    }
++  }
++  catch(const Glib::Error&)
++  {
++    // Non lisible par GdkPixbuf (PDF, PostScript...) : on continue.
++  }
++
++  // GdkPixbuf ne lit pas le PDF : on le reconnait par sa signature (le rendu se
++  // fait ensuite via Poppler dans get_pixbuf_for_gda_value).
++  if(gda_binary->binary_length >= 4)
++  {
++    const guchar* sig = gda_binary->data;
++    if(sig[0] == '%' && sig[1] == 'P' && sig[2] == 'D' && sig[3] == 'F')
++      return "application/pdf";
++  }
++
+   bool uncertain = false;
+-  const auto result = Gio::content_type_guess(std::string(),
++  return Gio::content_type_guess(std::string(),
+     gda_binary->data, gda_binary->binary_length,
+     uncertain);
+-
+-  //std::cout << G_STRFUNC << ": mime_type=" << result << ", uncertain=" << uncertain << std::endl;
+-  return result;
+ }
+ 
+ void ImageGlom::fill_evince_supported_mime_types()
+@@ -365,7 +393,13 @@
+   //std::cout << "mime_type=" << mime_type << std::endl;
+ 
+   fill_evince_supported_mime_types();
+-  if(Utils::find_exists(m_evince_supported_mime_types, mime_type))
++  fill_gdkpixbuf_supported_mime_types();
++  // Preferer GdkPixbuf pour toute image qu'il sait decoder ; Evince seulement
++  // pour ce qu'il ne lit pas. Le PDF est traite a part (rendu Poppler via le
++  // chemin GdkPixbuf), donc exclu d'Evince.
++  if(Utils::find_exists(m_evince_supported_mime_types, mime_type) &&
++     !Utils::find_exists(m_gdkpixbuf_supported_mime_types, mime_type) &&
++     mime_type != "application/pdf")
+   {
+     use_evince = true;
+   }
+@@ -418,7 +452,8 @@
+ 
+     bool use_gdkpixbuf = false;
+     fill_gdkpixbuf_supported_mime_types();
+-    if(Utils::find_exists(m_gdkpixbuf_supported_mime_types, mime_type))
++    if(Utils::find_exists(m_gdkpixbuf_supported_mime_types, mime_type) ||
++       mime_type == "application/pdf")
+     {
+       use_gdkpixbuf = true;
+     }
+@@ -606,7 +641,14 @@
+ 
+ Glib::ustring ImageGlom::save_to_temp_file(bool show_progress)
+ {
+-  Glib::ustring uri = FileUtils::get_temp_file_uri("glom_image");
++  //Evince identifie le fichier temporaire par son nom sur macOS : on lui donne
++  //l'extension du type, sinon un fichier sans extension est refuse.
++  std::string extension;
++  const auto temp_mime_type = get_mime_type();
++  if(temp_mime_type == "application/postscript")
++    extension = ".ps";
++
++  Glib::ustring uri = FileUtils::get_temp_file_uri("glom_image", extension);
+   if(uri.empty())
+   {
+     std::cerr << G_STRFUNC << ": : uri is empty.\n";
+--- glom/utils_ui.cc
++++ glom/utils_ui.cc
+@@ -29,6 +29,9 @@
+ 
+ #include <libglom/data_structure/layout/layoutitem_image.h> // For GLOM_IMAGE_FORMAT
+ #include <gdkmm/pixbufloader.h>
++#include <poppler.h>   // Rendu PDF (macOS : Evince inutilisable)
++#include <cairo.h>
++#include <cmath>
+ #include <libgda/gda-blob-op.h> // For gda_blob_op_read_all()
+ 
+ #include <gtkmm/messagedialog.h>
+@@ -251,6 +254,47 @@
+     /* Note that this is regular binary data, not escaped text representing the binary data: */
+     if(buffer_binary && buffer_binary_length)
+     {
++      //PDF : GdkPixbuf ne sait pas le lire. On rend la premiere page avec Poppler
++      //(deja dans le bundle), ce qui evite Evince et sa detection de type cassee
++      //sur macOS. Reconnu par sa signature %PDF.
++      const guchar* pdf_sig = static_cast<const guchar*>(buffer_binary);
++      if(buffer_binary_length >= 4 && pdf_sig[0] == '%' && pdf_sig[1] == 'P' &&
++         pdf_sig[2] == 'D' && pdf_sig[3] == 'F')
++      {
++        GBytes* pdf_bytes = g_bytes_new(buffer_binary, static_cast<gsize>(buffer_binary_length));
++        GError* pdf_error = nullptr;
++        PopplerDocument* pdf_doc = poppler_document_new_from_bytes(pdf_bytes, nullptr, &pdf_error);
++        if(pdf_doc)
++        {
++          PopplerPage* pdf_page = poppler_document_get_page(pdf_doc, 0);
++          if(pdf_page)
++          {
++            double pw = 0.0, ph = 0.0;
++            poppler_page_get_size(pdf_page, &pw, &ph);
++            const int iw = std::max(1, static_cast<int>(std::ceil(pw)));
++            const int ih = std::max(1, static_cast<int>(std::ceil(ph)));
++            cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, iw, ih);
++            cairo_t* cr = cairo_create(surface);
++            cairo_set_source_rgb(cr, 1.0, 1.0, 1.0); //fond blanc
++            cairo_paint(cr);
++            poppler_page_render(pdf_page, cr);
++            cairo_destroy(cr);
++            cairo_surface_flush(surface);
++            result = Glib::wrap(gdk_pixbuf_get_from_surface(surface, 0, 0, iw, ih));
++            cairo_surface_destroy(surface);
++            g_object_unref(pdf_page);
++          }
++          g_object_unref(pdf_doc);
++        }
++        else if(pdf_error)
++        {
++          std::cerr << G_STRFUNC << ": Poppler: " << pdf_error->message << std::endl;
++          g_error_free(pdf_error);
++        }
++        g_bytes_unref(pdf_bytes);
++        return result;
++      }
++
+       //typedef std::vector<Gdk::PixbufFormat> type_list_formats;
+       //const auto formats = Gdk::Pixbuf::get_formats();
+       //std::cout << "Debug: Supported pixbuf formats:\n";
+@@ -276,9 +320,11 @@
+         try
+         {
+           refPixbufLoader->write(puiData, static_cast<gsize>(buffer_binary_length));
+-          result = refPixbufLoader->get_pixbuf();
+ 
+-          refPixbufLoader->close(); //This throws if write() threw, so it must be inside the try block.
++          //close() doit preceder get_pixbuf() : certains chargeurs (PNG, GIF,
++          //SVG, TIFF, HEIF) ne finalisent le pixbuf qu'a la fermeture.
++          refPixbufLoader->close();
++          result = refPixbufLoader->get_pixbuf();
+         }
+ 
+         catch(const Glib::Exception& ex)

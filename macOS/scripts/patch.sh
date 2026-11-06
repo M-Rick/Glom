@@ -10,7 +10,8 @@
 #   py27-gobject3  : -Dtests=false
 #   glom           : python 3.14 ; retrait deps doc ; boost 1.88 ; ldflags module python ;
 #                    integration macOS (menu + file chooser) + gtk-osx-application-gtk3 ;
-#                    correction des raccourcis Edit (win.copy/paste/cut)
+#                    correction des raccourcis Edit (win.copy/paste/cut) ;
+#                    affichage des images (type MIME devine par GdkPixbuf sur macOS)
 #   gettext        : liens des macros m4 vers aclocal
 #
 # Reconstruction ensuite : uninstall PUIS clean PUIS install.
@@ -25,7 +26,8 @@ ROOT="$macports/var/macports/sources/rsync.macports.org/macports/release/tarball
 here="$(cd "$(dirname "$0")" && pwd)"
 patches="$here/../patches"
 for _p in patch-glibmm-libcxx19-char-traits.diff patch-libgda-postgres-modern-catalog.diff \
-          autogen.sh glom-macos-menubar.patch glom-macos-filechooser.patch glom-accels-fix.patch; do
+          autogen.sh glom-macos-menubar.patch glom-macos-filechooser.patch glom-accels-fix.patch \
+          glom-macos-image-mime.patch; do
   [ -f "$patches/$_p" ] || { echo "correctif manquant: $patches/$_p" >&2; exit 2; }
 done
 
@@ -67,11 +69,23 @@ GMF="$(dirname "$GM")/files"; mkdir -p "$GMF"
 cp "$patches/glom-macos-menubar.patch"     "$GMF/glom-macos-menubar.patch"
 cp "$patches/glom-macos-filechooser.patch" "$GMF/glom-macos-filechooser.patch"
 cp "$patches/glom-accels-fix.patch"      "$GMF/glom-accels-fix.patch"
+cp "$patches/glom-macos-image-mime.patch" "$GMF/glom-macos-image-mime.patch"
 add_after_revision "$GM" 'gtk-osx-application-gtk3'      'depends_lib-append  port:gtk-osx-application-gtk3'
 add_after_revision "$GM" 'glom-macos-menubar.patch'     'patchfiles-append   glom-macos-menubar.patch'
 add_after_revision "$GM" 'glom-macos-filechooser.patch' 'patchfiles-append   glom-macos-filechooser.patch'
 add_after_revision "$GM" 'glom-accels-fix.patch'        'patchfiles-append   glom-accels-fix.patch'
+add_after_revision "$GM" 'glom-macos-image-mime.patch'  'patchfiles-append   glom-macos-image-mime.patch'
 echo "  integration macOS (menu + file chooser) + raccourcis + gtk-osx-application-gtk3"
+# PDF : rendu via Poppler (dependance de compilation de glom, en plus du patch)
+if ! grep -qF 'poppler-glib' "$GM"; then
+  cat >> "$GM" <<'TCL'
+
+depends_lib-append          port:poppler
+configure.cppflags-append   [exec ${prefix}/bin/pkg-config --cflags poppler-glib]
+configure.ldflags-append    [exec ${prefix}/bin/pkg-config --libs poppler-glib]
+TCL
+  echo "  dependance Poppler (PDF) ajoutee"
+fi
 echo "gettext (macros m4 vers aclocal) :"
 gm="$macports/share/gettext/m4"; acl="$macports/share/aclocal"
 if [ -d "$gm" ]; then mkdir -p "$acl"; n=0

@@ -169,7 +169,7 @@ libgtk-quartz-2.0 libgdk-quartz-2.0 libaom libx265 libSvtAv1Enc libkvazaar libop
 FORCE_KEEP_ROOTS="libpq libgda-5.0 libgda-postgres libgdamm-5.0 libglibmm-2.4 \
 libgiomm-2.4 libgtkmm-3.0 libgdkmm-3.0 libgoocanvas-2.0 libgoocanvasmm-2.0 \
 libgtksourceview-3.0 libxml++-3.0 libepc-1.0 \
-libpng libtiff libjpeg libopenjp2 librsvg-2 \
+libpng libtiff libjpeg libopenjp2 librsvg-2 libwebp libwebpdemux libwebpmux \
 libheif libde265 libdav1d libspectre libgs libpoppler libpoppler-glib \
 libxml2 libxslt libicui18n libicuuc libicudata \
 libgtkmacintegration-gtk3 libsecret-1 libgcr-base-3"
@@ -215,8 +215,8 @@ libncurses++.6.dylib libnpth.0.dylib libpcre2-16.0.dylib libpcre2-32.0.dylib \
 libpcre2-posix.3.dylib libpoppler-cpp.3.0.0.dylib libpotrace.0.dylib libptexenc.1.dylib \
 libpth.20.0.27.dylib libsasl2.3.dylib libsigc-3.0.0.dylib libssh2.1.dylib \
 libtexlua53.5.dylib libtexluajit.2.dylib libtiffxx.6.dylib libturbojpeg.0.5.0.dylib \
-libuchardet.0.0.8.dylib libwebp.7.dylib libwebpdecoder.3.dylib libwebpdemux.2.dylib \
-libwebpmux.3.dylib libwrap.7.dylib libxcb-composite.0.0.0.dylib libxcb-damage.0.0.0.dylib \
+libuchardet.0.0.8.dylib libwebpdecoder.3.dylib \
+libwrap.7.dylib libxcb-composite.0.0.0.dylib libxcb-damage.0.0.0.dylib \
 libxcb-dbe.0.0.0.dylib libxcb-dpms.0.0.0.dylib libxcb-dri2.0.0.0.dylib libxcb-dri3.0.1.0.dylib \
 libxcb-glx.0.0.0.dylib libxcb-present.0.0.0.dylib libxcb-randr.0.1.0.dylib libxcb-record.0.0.0.dylib \
 libxcb-render.0.0.0.dylib libxcb-res.0.0.0.dylib libxcb-screensaver.0.0.0.dylib libxcb-shape.0.0.0.dylib \
@@ -360,6 +360,12 @@ step4(){
       quarantine "$RES/lib/$d"
     fi
   done
+
+  # lib/mysql57 est garde (libmysqlclient, utilise par le provider MySQL de
+  # libgda), mais ses plugins SERVEUR (mysqlx, memcached) et le plugin d'auth
+  # LDAP ne sont jamais charges par un client : ils referencent libevent/libsasl2
+  # qu'on retire, d'ou des dependances pendantes signalees par le controle.
+  [ -d "$RES/lib/mysql57/plugin" ] && quarantine "$RES/lib/mysql57/plugin"
 
   hdr "Etape 4c : lib/ dylib a plat (liste noire, sauf atteintes ou forcees)"
   local spared=0

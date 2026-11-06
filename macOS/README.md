@@ -45,7 +45,7 @@ sous `patches/` (source unique, aucune copie) ; les scripts ci-dessous les
 copient dans les ports MacPorts et les cablent (`patchfiles-append`).
 
 ```
-sudo bash scripts/patch.sh $macports                 # libgda + glibmm + les 3 correctifs macOS de glom (voir la table)
+sudo bash scripts/patch.sh $macports                 # libgda + glibmm + les 4 correctifs macOS de glom (voir la table)
 sudo PORT="$macports/bin/port" bash scripts/patch-portfiles-pg18.sh   # localise libgda5 et glom via 'port file'
 sudo bash scripts/apply-migrate-menu-patch.sh $dir   # menu Fichier > Migrate a Database + traductions (21 langues)
 sudo bash scripts/apply-setenv-patch.sh $dir         # glom : environnement C au processus enfant (setenv non thread-safe)
@@ -62,6 +62,7 @@ Qui applique quoi (chaque fichier de `patches/` a exactement un script) :
 | `glom-macos-menubar.patch` | `patch.sh` | glom | barre de menus macOS + garde anti-reentrance Cmd+Q |
 | `glom-macos-filechooser.patch` | `patch.sh` | glom | selecteur de fichiers |
 | `glom-accels-fix.patch` | `patch.sh` | glom | raccourcis Edit |
+| `glom-macos-image-mime.patch` | `patch.sh` | glom | affichage des images macOS : detection du format, ordre close/get_pixbuf, routage GdkPixbuf/Evince (TIFF), rendu PDF via Poppler |
 | `glom-macos-migrate-menu.patch` | `apply-migrate-menu-patch.sh` | glom | menu Migrate a Database + 21 langues |
 | `glom-spawn-setenv-threadsafe.patch` | `apply-setenv-patch.sh` | glom | setenv non thread-safe (plantage creation base) |
 | `patch-libgda-xmlrow-overflow.diff` | `apply-libgda-xmlrow-patch.sh` | libgda5 | debordement add_xml_row (plantage creation base) |
@@ -92,6 +93,7 @@ sudo $macports/bin/port install libglade2 +quartz+python314-docs-x11
 sudo $macports/bin/port -f activate shared-mime-info
 sudo $macports/bin/port select --set docutils py314-docutils
 sudo $macports/bin/port install gtk3 +quartz+python314-x11
+sudo $macports/bin/port install webp-pixbuf-loader   # chargeur WebP pour GdkPixbuf (apres gdk-pixbuf2 de gtk3)
 sudo $macports/bin/port install graphviz +pangocairo-x11
 sudo $macports/bin/port install libgda5 +mysql57+postgresql18+quartz-x11+python314-docs
 sudo $macports/bin/port -f activate python27
@@ -106,6 +108,12 @@ sudo $macports/bin/port install glom +mysql57+postgresql18+quartz+python314-docs
 sudo $macports/bin/port -f activate dbus
 sudo $macports/bin/port -f activate texlive-bin
 ```
+
+Formats d'image : Poppler (affichage des PDF) est tire automatiquement, `patch.sh`
+ajoute `depends_lib poppler` au Portfile de glom. Le WebP vient du port
+`webp-pixbuf-loader` installe dans la sequence ci-dessus (GdkPixbuf n'a pas de
+chargeur WebP par defaut) ; le cache des chargeurs qui le reference est regenere
+par `finalize`.
 
 Note ABI : si la creation de base plante apres coup, rebatir `libgdamm5` APRES
 `libgda5` (uninstall, clean, install), puis `glom`.
@@ -154,12 +162,11 @@ sudo bash install-pg-framework.sh      # copie puis allege le framework dans Con
 
 `slim-glom.sh` met tout en quarantaine (reversible par `restore`), jamais de
 suppression seche, et dans un dossier **hors du depot** (`.Glom-slim-quarantaine`
-a cote du bundle). Il retire la chaine de build, MySQL, les en-tetes C++, et
+a cote du bundle). Il retire la chaine de build, les plugins serveur MySQL (le client `libmysqlclient` reste), les en-tetes C++, et
 surtout toute bibliotheque `.dylib` a plat que la fermeture de dependances
 `otool` n'atteint pas (depuis `glom`, les modules charges dynamiquement, les
 executables PostgreSQL et les typelibs d'introspection) : liaisons C++ 2.68/1.16
-inutilisees, X11/xcb (le backend est Quartz), variantes harfbuzz, TeX, webp et
-jasper sans chargeur, git, etc. Gain de l'ordre de 477 Mo, on revient pres du
+inutilisees, X11/xcb (le backend est Quartz), variantes harfbuzz, TeX, jasper (JPEG 2000, pas de chargeur GdkPixbuf), git, etc. Gain de l'ordre de 477 Mo, on revient pres du
 poids d'avant PostgreSQL. Lancer d'abord SANS `--run` (apercu), verifier, puis
 agir, puis `check`, puis tester Glom (creer une base, afficher une image) avant
 de finaliser.
@@ -234,6 +241,9 @@ fonctionne meme sans `/Library/Frameworks`. Libelles traduits en 21 langues
   renomme ne retrouve plus ses bibliotheques et refuse de demarrer. La conversion
   des liens symboliques en relatif sert a la signature, elle ne rend pas pour
   autant le bundle relocalisable.
+- Affichage des images : raster (PNG, JPEG, GIF, BMP, TIFF, HEIF), SVG et WebP
+  via GdkPixbuf, PDF rendu par Poppler. Un champ image vide affiche l'icone
+  `image-missing` fournie par le theme (clair et sombre).
 
 ## Licences
 
